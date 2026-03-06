@@ -23,6 +23,9 @@ build/
 .DS_Store
 Thumbs.db
 
+# Auto-generated config stubs
+*.pyi
+
 # Alembic
 alembic/versions/__pycache__/
 
