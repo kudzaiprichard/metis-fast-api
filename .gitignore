@@ -26,8 +26,9 @@ Thumbs.db
 # Auto-generated config stubs
 *.pyi
 
-# Alembic
+# Alembic — ignore pycache but keep migration files
 alembic/versions/__pycache__/
+!alembic/versions/*.py
 
 # Model artifacts
 *.pkl

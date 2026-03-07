@@ -27,6 +27,11 @@ security:
     algorithm: "${JWT_ALGORITHM:HS256} | str"
     access_token_expire_minutes: "${ACCESS_TOKEN_EXPIRE_MINUTES:30} | int"
     refresh_token_expire_days: "${REFRESH_TOKEN_EXPIRE_DAYS:7} | int"
+  admin:
+    email: "${ADMIN_EMAIL:admin@metis.com} | str"
+    username: "${ADMIN_USERNAME:admin} | str"
+    password: "${ADMIN_PASSWORD:Admin@1234} | str"
+  token_cleanup_interval_seconds: "${TOKEN_CLEANUP_INTERVAL:3600} | int"
 
 server:
   cors:
