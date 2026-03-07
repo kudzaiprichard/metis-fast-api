@@ -21,7 +21,7 @@ def create_app() -> FastAPI:
 
 
 def _register_routers(app: FastAPI) -> None:
-    # Will mount module routers here as we build them
-    # from src.modules.auth.router import router as auth_router
-    # app.include_router(auth_router, prefix="/api/v1/auth", tags=["Auth"])
-    pass
+    from src.modules.auth import auth_router, user_router
+
+    app.include_router(auth_router, prefix="/api/v1/auth", tags=["Auth"])
+    app.include_router(user_router, prefix="/api/v1/users", tags=["Users"])
