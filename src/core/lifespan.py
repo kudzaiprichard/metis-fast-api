@@ -4,7 +4,7 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from src.shared.database.engine import engine
-from src.configs import logging as log_config
+from src.configs import logging as log_config, model as model_config
 
 
 logger = logging.getLogger(__name__)
@@ -29,11 +29,35 @@ def _setup_logging() -> None:
     )
 
 
+def _load_models() -> None:
+    """Load ML models into the registry at startup."""
+    from src.modules.models.internal.model_loader import registry
+
+    registry.load(
+        name="default",
+        model_file=model_config.model_file,
+        pipeline_file=model_config.pipeline_file,
+    )
+    # Future models:
+    # registry.load(
+    #     name="v2",
+    #     model_file="neural_thompson_v2.pt",
+    #     pipeline_file="feature_pipeline_v2.joblib",
+    # )
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     # Startup
     _setup_logging()
     logger.info("Starting up — logging and DB pool initialised")
+
+    # Load ML models into memory
+    try:
+        _load_models()
+        logger.info("ML models loaded into memory")
+    except Exception as e:
+        logger.error("Failed to load ML models: %s", e)
 
     # Seed default admin
     from src.modules.auth.internal.admin_seeder import seed_admin

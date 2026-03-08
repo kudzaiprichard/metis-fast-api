@@ -22,6 +22,12 @@ def create_app() -> FastAPI:
 
 def _register_routers(app: FastAPI) -> None:
     from src.modules.auth import auth_router, user_router
+    from src.modules.patients import patient_router
+    from src.modules.models import inference_router
+    from src.modules.predictions import prediction_router
 
     app.include_router(auth_router, prefix="/api/v1/auth", tags=["Auth"])
     app.include_router(user_router, prefix="/api/v1/users", tags=["Users"])
+    app.include_router(patient_router, prefix="/api/v1/patients", tags=["Patients"])
+    app.include_router(inference_router, prefix="/api/v1/inference", tags=["Inference"])
+    app.include_router(prediction_router, prefix="/api/v1/predictions", tags=["Predictions"])
