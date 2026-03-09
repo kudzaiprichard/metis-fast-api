@@ -49,9 +49,6 @@ model:
   path: "${MODEL_PATH:models} | str"
   model_file: "${MODEL_FILE:neural_thompson.pt} | str"
   pipeline_file: "${PIPELINE_FILE:feature_pipeline_scaled.joblib} | str"
-  input_dim: "${MODEL_INPUT_DIM:25} | int"
-  hidden_dims: "${MODEL_HIDDEN_DIMS:128,64} | list"
-  noise_variance: "${MODEL_NOISE_VARIANCE:0.25} | float"
 
 gemini:
   api_key: "${GEMINI_API_KEY} | str | required"

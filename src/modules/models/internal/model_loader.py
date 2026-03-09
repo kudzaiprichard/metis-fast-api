@@ -10,6 +10,10 @@ from src.modules.models.internal.explainability import ExplainabilityExtractor
 
 logger = logging.getLogger(__name__)
 
+# Static model hyperparameters (must match training configuration)
+DEFAULT_HIDDEN_DIMS = [128, 64]
+DEFAULT_NOISE_VARIANCE = 0.25
+
 
 @dataclass
 class ModelBundle:
@@ -40,9 +44,6 @@ class ModelRegistry:
         name: str,
         model_file: str,
         pipeline_file: str,
-        input_dim: Optional[int] = None,
-        hidden_dims: Optional[list] = None,
-        noise_variance: Optional[float] = None,
         base_path: Optional[str] = None,
     ) -> ModelBundle:
         """Load a model bundle into memory under the given name."""
@@ -51,16 +52,17 @@ class ModelRegistry:
             return self._models[name]
 
         base_path = base_path or model_config.path
-        input_dim = input_dim or model_config.input_dim
-        hidden_dims = hidden_dims or [int(d) for d in model_config.hidden_dims]
-        noise_variance = noise_variance if noise_variance is not None else model_config.noise_variance
 
-        # Load pipeline
+        # Load pipeline first
         pipeline_path = Path(base_path) / pipeline_file
         if not pipeline_path.exists():
             raise FileNotFoundError(f"Pipeline not found: {pipeline_path}")
         pipeline = FeaturePipeline.load(str(pipeline_path))
         logger.info("Pipeline loaded: %s", pipeline_path)
+
+        # Derive input_dim from pipeline
+        input_dim = len(pipeline.features)
+        logger.info("Input dim derived from pipeline: %d", input_dim)
 
         # Load model
         model_path = Path(base_path) / model_file
@@ -68,8 +70,8 @@ class ModelRegistry:
             raise FileNotFoundError(f"Model not found: {model_path}")
         model = NeuralThompson(
             input_dim=input_dim,
-            hidden_dims=hidden_dims,
-            noise_variance=noise_variance,
+            hidden_dims=DEFAULT_HIDDEN_DIMS,
+            noise_variance=DEFAULT_NOISE_VARIANCE,
         )
         model.load(str(model_path))
         logger.info("Model loaded: %s", model_path)
@@ -84,8 +86,8 @@ class ModelRegistry:
             extractor=extractor,
             model_path=str(model_path),
             input_dim=input_dim,
-            hidden_dims=hidden_dims,
-            noise_variance=noise_variance,
+            hidden_dims=DEFAULT_HIDDEN_DIMS,
+            noise_variance=DEFAULT_NOISE_VARIANCE,
         )
         self._models[name] = bundle
         logger.info("Model '%s' registered", name)
@@ -112,8 +114,8 @@ class ModelRegistry:
 
         model = NeuralThompson(
             input_dim=bundle.input_dim,
-            hidden_dims=bundle.hidden_dims,
-            noise_variance=bundle.noise_variance,
+            hidden_dims=DEFAULT_HIDDEN_DIMS,
+            noise_variance=DEFAULT_NOISE_VARIANCE,
         )
         model.load(bundle.model_path)
 
