@@ -14,6 +14,9 @@ from src.modules.auth.domain.models.token import Token
 from src.modules.patients.domain.models.patient import Patient
 from src.modules.patients.domain.models.medical_record import MedicalRecord
 from src.modules.predictions.domain.models.prediction import Prediction
+from src.modules.simulations.domain.models.simulation import Simulation
+from src.modules.simulations.domain.models.simulation_step import SimulationStep
+
 
 config = context.config
 
