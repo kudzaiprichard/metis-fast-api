@@ -1,6 +1,6 @@
 # Metis
 
-A modular FastAPI clinical decision support system for Type 2 Diabetes treatment selection. Uses a Contextual Bandit (Neural Thompson Sampling) to recommend personalised treatments, with async SQLAlchemy, JWT authentication, role-based access control, and a config system driven by YAML and environment variables.
+A modular FastAPI clinical decision support system for Type 2 Diabetes treatment selection. Uses a Contextual Bandit (Neural Thompson Sampling) to recommend personalised treatments, with async SQLAlchemy, JWT authentication, role-based access control, real-time simulation streaming via SSE, and a config system driven by YAML and environment variables.
 
 ---
 
@@ -15,6 +15,7 @@ A modular FastAPI clinical decision support system for Type 2 Diabetes treatment
 - [Patients Module](#patients-module)
 - [Models Module](#models-module)
 - [Predictions Module](#predictions-module)
+- [Simulations Module](#simulations-module)
 - [Adding a New Module](#adding-a-new-module)
 - [Shared Layer](#shared-layer)
 - [Database Migrations](#database-migrations-alembic)
@@ -58,7 +59,8 @@ A modular FastAPI clinical decision support system for Type 2 Diabetes treatment
 │       ├── auth/                  # Authentication & user management
 │       ├── patients/              # Patient records & medical data
 │       ├── models/                # ML inference (stateless)
-│       └── predictions/           # Clinical workflow & decision tracking
+│       ├── predictions/           # Clinical workflow & decision tracking
+│       └── simulations/           # Bandit simulation with real-time SSE streaming
 ```
 
 ---
@@ -99,6 +101,7 @@ numpy
 pandas
 loguru
 google-genai
+sse-starlette
 ```
 
 ### Environment
@@ -317,8 +320,25 @@ Stateless ML inference utility. Loads the NeuralThompson model and FeaturePipeli
 - `feature_engineering.py` — FeaturePipeline (from ML project, imports updated)
 - `explainability.py` — ExplainabilityExtractor + safety checks + fairness (from ML project, imports updated)
 - `llm_explainer.py` — LLMExplainer + Gemini prompt (from ML project, imports updated)
-- `model_loader.py` — loads pipeline, model, extractor from config paths
+- `model_loader.py` — ModelRegistry with `load()`, `get()`, and `clone_fresh()` for dedicated model instances
 - `inference_engine.py` — orchestrates: predict(), predict_with_explanation(), explain(), predict_batch()
+
+### Model Registry
+
+The `ModelRegistry` manages model bundles in memory and provides two access patterns:
+
+```python
+from src.modules.models.internal.model_loader import registry
+
+# Shared model for inference (read-only, posterior intact)
+bundle = registry.get("default")
+bundle.model       # shared NeuralThompson instance
+bundle.pipeline    # shared FeaturePipeline instance
+
+# Dedicated clone for simulations or experimentation
+model = registry.clone_fresh("default")                          # posterior reset (learns from scratch)
+model = registry.clone_fresh("default", reset_posterior=False)   # posterior preserved
+```
 
 ### Endpoints (`/api/v1/inference`) — ADMIN, DOCTOR
 
@@ -371,6 +391,97 @@ The core clinical workflow. Connects patients, ML model, and persistence.
 patients (1) ──→ (many) medical_records (1) ──→ (many) predictions
                                                          ↑
                                                     users (doctor)
+```
+
+---
+
+## Simulations Module
+
+Admin-only bandit simulation with real-time SSE streaming. Evaluates model performance by running the exploration vs exploitation loop over uploaded patient datasets.
+
+### How It Works
+1. Admin uploads a CSV file with patient records (minimum 100 rows, 16 clinical features)
+2. `POST /api/v1/simulations` validates the CSV and creates a simulation record
+3. A background task runs the bandit loop: for each patient → model decides → oracle evaluates → posterior updates → step streamed via SSE
+4. Frontend connects to `GET /api/v1/simulations/{id}/stream` and receives each step in real-time
+5. On completion, final aggregates are stored in the database for later review
+
+### Entities
+- `Simulation` — config (epsilon schedule, seed, reset_posterior), dataset info (filename, row count), status tracking, final aggregates (accuracy, reward, regret, treatment distribution, confidence/safety distributions)
+- `SimulationStep` — per-patient data: patient context, oracle ground truth, model decision (posterior means, win rates, confidence, sampled values), exploration metadata, outcome (reward, regret, matched oracle), safety status, and running aggregates
+
+### Internal Files
+- `reward_oracle.py` — ground-truth reward function copied from the ML project, computes expected HbA1c reduction per patient-treatment pair
+- `simulation_runner.py` — async background task that runs the bandit loop, mirrors the notebook exactly. Contains `extract_step()` (per-patient payload extraction), `parse_and_validate_csv()` (CSV validation with type/range checks), and `run_simulation()` (the main loop)
+- `stream_manager.py` — manages SSE streams via `asyncio.Queue` fan-out. Supports multiple concurrent viewers per simulation, keepalive pings, error propagation, and cleanup on completion
+
+### Key Design Decisions
+- **CSV required** — no synthetic data generation. The CSV is the single source of truth; row count determines how many steps run
+- **Model cloned via `registry.clone_fresh()`** — creates a dedicated NeuralThompson instance so posterior updates don't affect the shared inference model
+- **`reset_posterior` option** — admin can choose whether the model starts from prior (watch it learn from scratch) or keeps its learned posterior (evaluate trained model on new data)
+- **Backend computes aggregates** — running totals (cumulative reward, regret, accuracy, treatment counts, per-treatment estimates) are computed server-side and streamed with each step. Ensures consistency across multiple viewers and trivial reconnection
+- **SSE over WebSocket** — one-way server-to-client stream, simpler protocol, auto-reconnects. Keepalive pings every 30 seconds
+- **Reconnection support** — `last_step` query param on the stream endpoint replays stored steps from DB, then switches to live
+- **DB persistence in batches** — steps buffered and flushed every 50 steps for performance. Progress updated every 10 steps
+- **Max 3 concurrent simulations** — prevents resource exhaustion
+
+### Simulation Flow
+
+```
+Admin uploads CSV
+  → Validate CSV (16 features, types, ranges, min 100 rows)
+  → Create Simulation record (PENDING)
+  → Launch background task
+    → Load model via registry.clone_fresh()
+    → Mark RUNNING
+    → For each patient in CSV:
+        → extract_step (oracle + model decision + safety)
+        → Update running aggregates
+        → Update model posterior
+        → Push step to SSE stream
+        → Buffer step for DB
+    → Flush remaining steps
+    → Save final aggregates → Mark COMPLETED
+    → Push stream complete signal
+```
+
+### SSE Event Types
+
+| Event | When | Data |
+|-------|------|------|
+| `step` | Each patient processed | Full step payload with aggregates |
+| `ping` | Every 30s (keepalive) | Empty |
+| `error` | Simulation fails | Error message |
+| `complete` | Simulation finishes | Status (COMPLETED/FAILED) |
+
+### Endpoints (`/api/v1/simulations`) — ADMIN only
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | / | Start simulation (CSV upload + optional config) |
+| GET | /{id}/stream | SSE real-time stream (supports reconnection) |
+| GET | / | List simulations (paginated) |
+| GET | /{id} | Get simulation with final aggregates |
+| GET | /{id}/steps | Get stored steps (for replay/analysis) |
+| DELETE | /{id} | Delete simulation (blocked if running) |
+
+### Request Format
+
+The POST endpoint accepts multipart form data:
+
+| Field | Type | Required | Default | Description |
+|-------|------|----------|---------|-------------|
+| `file` | CSV | Yes | — | Patient records (min 100 rows) |
+| `initial_epsilon` | float | No | 0.3 | Starting epsilon |
+| `epsilon_decay` | float | No | 0.997 | Decay factor per step |
+| `min_epsilon` | float | No | 0.01 | Epsilon floor |
+| `random_seed` | int | No | 42 | Reproducibility seed |
+| `reset_posterior` | bool | No | true | Start from prior or keep learned posterior |
+
+### Database Relationships
+
+```
+simulations (1) ──→ (many) simulation_steps
 ```
 
 ---
@@ -498,6 +609,8 @@ from src.modules.auth.domain.models.token import Token
 from src.modules.patients.domain.models.patient import Patient
 from src.modules.patients.domain.models.medical_record import MedicalRecord
 from src.modules.predictions.domain.models.prediction import Prediction
+from src.modules.simulations.domain.models.simulation import Simulation
+from src.modules.simulations.domain.models.simulation_step import SimulationStep
 ```
 
 ---
