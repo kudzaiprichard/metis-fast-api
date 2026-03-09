@@ -1,6 +1,6 @@
 import logging
 from pathlib import Path
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 from src.configs import model as model_config
@@ -18,6 +18,10 @@ class ModelBundle:
     pipeline: FeaturePipeline
     model: NeuralThompson
     extractor: ExplainabilityExtractor
+    model_path: str = ""
+    input_dim: int = 0
+    hidden_dims: list = field(default_factory=list)
+    noise_variance: float = 0.25
 
 
 class ModelRegistry:
@@ -78,6 +82,10 @@ class ModelRegistry:
             pipeline=pipeline,
             model=model,
             extractor=extractor,
+            model_path=str(model_path),
+            input_dim=input_dim,
+            hidden_dims=hidden_dims,
+            noise_variance=noise_variance,
         )
         self._models[name] = bundle
         logger.info("Model '%s' registered", name)
@@ -90,6 +98,33 @@ class ModelRegistry:
                 f"Model '{name}' not loaded. Available: {list(self._models.keys())}"
             )
         return self._models[name]
+
+    def clone_fresh(self, name: str, reset_posterior: bool = True) -> NeuralThompson:
+        """
+        Create a fresh model instance from a registered bundle.
+
+        Args:
+            name: registered model name
+            reset_posterior: if True, resets posterior to prior (default).
+                             if False, keeps the learned posterior from the checkpoint.
+        """
+        bundle = self.get(name)
+
+        model = NeuralThompson(
+            input_dim=bundle.input_dim,
+            hidden_dims=bundle.hidden_dims,
+            noise_variance=bundle.noise_variance,
+        )
+        model.load(bundle.model_path)
+
+        if reset_posterior:
+            model.reset_posterior()
+
+        logger.info(
+            "Model cloned from '%s' (posterior %s)",
+            name, "reset" if reset_posterior else "preserved",
+        )
+        return model
 
     def remove(self, name: str) -> None:
         """Unload a model from memory."""
