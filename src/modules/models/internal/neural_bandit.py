@@ -244,12 +244,27 @@ class NeuralThompson(NeuralBanditBase):
             confidence_label = "MODERATE"
         else:
             confidence_label = "LOW"
+
+        # Build win_rates and posterior_means dicts
+        win_rates_dict = {IDX_TO_TREATMENT[k]: round(float(win_rates[k]), 3) for k in range(N_TREATMENTS)}
+        posterior_means_dict = {IDX_TO_TREATMENT[k]: round(float(posterior_means[k]), 2) for k in range(N_TREATMENTS)}
+
+        # Runner-up: sort by win rate, break ties with posterior mean
+        sorted_treatments = sorted(
+            win_rates_dict.items(),
+            key=lambda t: (t[1], posterior_means_dict[t[0]]),
+            reverse=True,
+        )
+        runner_up = sorted_treatments[1][0]
+        runner_up_win_rate = sorted_treatments[1][1]
+
         return {
-            "win_rates": {IDX_TO_TREATMENT[k]: round(float(win_rates[k]), 3) for k in range(N_TREATMENTS)},
+            "win_rates": win_rates_dict,
             "recommended": recommended, "recommended_idx": recommended_idx,
             "recommended_win_rate": round(float(recommended_win_rate), 3),
             "confidence_pct": confidence_pct, "confidence_label": confidence_label,
-            "posterior_means": {IDX_TO_TREATMENT[k]: round(float(posterior_means[k]), 2) for k in range(N_TREATMENTS)},
+            "posterior_means": posterior_means_dict,
+            "runner_up": runner_up, "runner_up_win_rate": round(float(runner_up_win_rate), 3),
             "mean_gap": round(float(mean_gap), 2), "n_draws": n_draws,
         }
 

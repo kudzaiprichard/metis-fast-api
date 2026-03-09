@@ -156,20 +156,17 @@ class ExplainabilityExtractor:
 
     def extract_model_decision(self, x: np.ndarray) -> Dict:
         confidence = self.model.compute_confidence(x, n_draws=self.n_confidence_draws)
-        recommended = confidence["recommended"]
-        win_rates = confidence["win_rates"]
-        posterior_means = confidence["posterior_means"]
-        sorted_treatments = sorted(win_rates.items(), key=lambda t: t[1], reverse=True)
-        runner_up = sorted_treatments[1][0]
-        runner_up_win_rate = sorted_treatments[1][1]
-        sorted_means = sorted(posterior_means.items(), key=lambda t: t[1], reverse=True)
-        mean_gap = sorted_means[0][1] - sorted_means[1][1]
         return {
-            "recommended_treatment": recommended, "recommended_idx": confidence["recommended_idx"],
-            "confidence_pct": confidence["confidence_pct"], "confidence_label": confidence["confidence_label"],
-            "win_rates": win_rates, "posterior_means": posterior_means,
-            "runner_up": runner_up, "runner_up_win_rate": round(runner_up_win_rate, 3),
-            "mean_gap": round(mean_gap, 2), "n_draws": confidence["n_draws"],
+            "recommended_treatment": confidence["recommended"],
+            "recommended_idx": confidence["recommended_idx"],
+            "confidence_pct": confidence["confidence_pct"],
+            "confidence_label": confidence["confidence_label"],
+            "win_rates": confidence["win_rates"],
+            "posterior_means": confidence["posterior_means"],
+            "runner_up": confidence["runner_up"],
+            "runner_up_win_rate": confidence["runner_up_win_rate"],
+            "mean_gap": confidence["mean_gap"],
+            "n_draws": confidence["n_draws"],
         }
 
     def extract_safety_and_fairness(self, context: Dict, recommended: str) -> Dict:
