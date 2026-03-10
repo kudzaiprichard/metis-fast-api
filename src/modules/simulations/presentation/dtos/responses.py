@@ -86,7 +86,81 @@ class SimulationResponse(BaseModel):
 
 
 # ──────────────────────────────────────────────
-# Simulation Step
+# SSE Step — lean payload for real-time streaming
+# Used by both live SSE and DB replay paths
+# ──────────────────────────────────────────────
+
+class SSEStepResponse(BaseModel):
+    """
+    Lean step payload for real-time SSE streaming.
+    Contains only the fields the frontend needs for live charts/indicators.
+    Full step details (patient context, oracle, safety, confidence,
+    posterior means, win rates, sampled values) are available via
+    GET /simulations/{id}/steps for drill-down views.
+    """
+    step: int
+    total_steps: int = Field(alias="totalSteps")
+    selected_idx: int = Field(alias="selectedIdx")
+    selected_treatment: str = Field(alias="selectedTreatment")
+    explored: bool
+    observed_reward: float = Field(alias="observedReward")
+    epsilon: float
+    running_estimates: Dict[str, float] = Field(alias="runningEstimates")
+    running_accuracy: float = Field(alias="runningAccuracy")
+    cumulative_reward: float = Field(alias="cumulativeReward")
+    cumulative_regret: float = Field(alias="cumulativeRegret")
+    treatment_counts: Dict[str, int] = Field(alias="treatmentCounts")
+
+    # Future: uncomment when frontend adds live detail indicators
+    # matched_oracle: Optional[bool] = Field(None, alias="matchedOracle")
+    # confidence_label: Optional[str] = Field(None, alias="confidenceLabel")
+    # safety_status: Optional[str] = Field(None, alias="safetyStatus")
+    # optimal_treatment: Optional[str] = Field(None, alias="optimalTreatment")
+    # instantaneous_regret: Optional[float] = Field(None, alias="instantaneousRegret")
+
+    class Config:
+        populate_by_name = True
+
+    @staticmethod
+    def from_runner(data: Dict) -> "SSEStepResponse":
+        """Build from the simulation runner's computed values."""
+        return SSEStepResponse(
+            step=data["step"],
+            totalSteps=data["total_steps"],
+            selectedIdx=data["selected_idx"],
+            selectedTreatment=data["selected_treatment"],
+            explored=data["explored"],
+            observedReward=data["observed_reward"],
+            epsilon=data["epsilon"],
+            runningEstimates=data["running_estimates"],
+            runningAccuracy=data["running_accuracy"],
+            cumulativeReward=data["cumulative_reward"],
+            cumulativeRegret=data["cumulative_regret"],
+            treatmentCounts=data["treatment_counts"],
+        )
+
+    @staticmethod
+    def from_entity(entity: SimulationStep, total_steps: int) -> "SSEStepResponse":
+        """Build from a DB entity for replay path."""
+        return SSEStepResponse(
+            step=entity.step_number,
+            totalSteps=total_steps,
+            selectedIdx=entity.selected_idx,
+            selectedTreatment=entity.selected_treatment,
+            explored=entity.thompson_explored,
+            observedReward=entity.observed_reward,
+            epsilon=entity.epsilon,
+            runningEstimates=entity.running_estimates,
+            runningAccuracy=entity.running_accuracy,
+            cumulativeReward=entity.cumulative_reward,
+            cumulativeRegret=entity.cumulative_regret,
+            treatmentCounts=entity.treatment_counts,
+        )
+
+
+# ──────────────────────────────────────────────
+# Simulation Step — full payload for REST endpoint
+# Served via GET /simulations/{id}/steps
 # ──────────────────────────────────────────────
 
 class StepOracleResponse(BaseModel):
