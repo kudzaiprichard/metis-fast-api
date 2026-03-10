@@ -17,15 +17,12 @@ from src.modules.simulations.domain.services.simulation_service import Simulatio
 from src.modules.simulations.presentation.dtos.responses import (
     SimulationResponse,
     SimulationStepResponse,
+    SSEStepResponse,
 )
 from src.modules.simulations.internal.simulation_runner import (
     run_simulation,
     parse_and_validate_csv,
-)
-from src.modules.simulations.internal.stream_manager import (
-    stream_manager,
-    STREAM_COMPLETE,
-    STREAM_ERROR,
+    simulation_registry,
 )
 
 logger = logging.getLogger(__name__)
@@ -40,30 +37,19 @@ async def start_simulation(
     epsilon_decay: float = Form(default=0.997, ge=0.9, le=1.0),
     min_epsilon: float = Form(default=0.01, ge=0.0, le=1.0),
     random_seed: int = Form(default=42, ge=0, le=999999),
+    reset_posterior: bool = Form(default=True),
     service: SimulationService = Depends(get_simulation_service),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Start a new bandit simulation.
-
-    Accepts a CSV file with patient records (minimum 100 rows, 16 clinical features).
-    Optionally accepts epsilon schedule and seed as form fields.
-    Returns the simulation immediately, then runs the loop in a background task
-    with SSE streaming.
-    """
-    # Validate file type
     if not file.filename or not file.filename.lower().endswith(".csv"):
         raise BadRequestException(
             message="Only CSV files are accepted",
             error_detail=ErrorDetail(
-                title="Invalid File",
-                code="INVALID_FILE_TYPE",
-                status=400,
+                title="Invalid File", code="INVALID_FILE_TYPE", status=400,
                 details=["Upload a .csv file containing patient records"],
             ),
         )
 
-    # Read and validate CSV content
     try:
         content = await file.read()
         csv_content = content.decode("utf-8")
@@ -71,9 +57,7 @@ async def start_simulation(
         raise BadRequestException(
             message="CSV file must be UTF-8 encoded",
             error_detail=ErrorDetail(
-                title="Invalid Encoding",
-                code="INVALID_ENCODING",
-                status=400,
+                title="Invalid Encoding", code="INVALID_ENCODING", status=400,
                 details=["Ensure the CSV file is saved with UTF-8 encoding"],
             ),
         )
@@ -84,14 +68,11 @@ async def start_simulation(
         raise BadRequestException(
             message="CSV validation failed",
             error_detail=ErrorDetail(
-                title="Validation Error",
-                code="CSV_VALIDATION_FAILED",
-                status=400,
+                title="Validation Error", code="CSV_VALIDATION_FAILED", status=400,
                 details=str(e).split("\n"),
             ),
         )
 
-    # Create simulation record
     simulation = await service.create_simulation(
         dataset_filename=file.filename,
         dataset_row_count=len(patients),
@@ -102,8 +83,8 @@ async def start_simulation(
         reset_posterior=reset_posterior,
     )
 
-    # Launch background task
-    asyncio.create_task(
+    # Launch simulation as background task — runs in this process
+    task = asyncio.create_task(
         run_simulation(
             simulation_id=simulation.id,
             patients=patients,
@@ -112,8 +93,17 @@ async def start_simulation(
             min_epsilon=min_epsilon,
             random_seed=random_seed,
             reset_posterior=reset_posterior,
-        )
+        ),
+        name=f"simulation-{simulation.id}",
     )
+
+    def _on_done(t: asyncio.Task) -> None:
+        if t.cancelled():
+            logger.info("Simulation task cancelled: %s", simulation.id)
+        elif t.exception():
+            logger.error("Simulation task failed: %s — %s", simulation.id, t.exception())
+
+    task.add_done_callback(_on_done)
 
     return ApiResponse.ok(
         value=SimulationResponse.from_entity(simulation),
@@ -131,8 +121,11 @@ async def stream_simulation(
     """
     SSE endpoint — streams simulation steps in real-time.
 
-    If last_step > 0, replays stored steps from DB first (reconnection support),
-    then switches to live stream.
+    If the simulation is still running, subscribes to the in-memory queue.
+    If the simulation is completed, replays from the database.
+    Supports reconnection via last_step parameter.
+
+    Both paths use SSEStepResponse DTO for consistent output shape.
     """
     from uuid import UUID as UUIDType
 
@@ -140,63 +133,64 @@ async def stream_simulation(
     simulation = await service.get_simulation(sim_id)
 
     async def event_generator():
-        # Replay stored steps if reconnecting
-        if last_step > 0:
-            stored_steps = await service.get_steps_from(sim_id, from_step=1, limit=last_step)
-            for step in stored_steps:
-                step_data = SimulationStepResponse.from_entity(step)
-                yield {
-                    "event": "step",
-                    "data": step_data.model_dump_json(by_alias=True),
-                }
+        # Check if simulation is still running in-memory
+        if simulation_registry.is_registered(sim_id) and not simulation_registry.is_completed(sim_id):
+            # Subscribe to live events
+            queue = simulation_registry.subscribe(sim_id)
+            if queue is None:
+                yield {"event": "error", "data": json.dumps({"error": "Failed to subscribe"})}
+                return
 
-        # Subscribe to live stream
-        queue = await stream_manager.subscribe(sim_id)
+            logger.info("SSE client subscribed to live simulation %s", simulation_id)
 
-        if queue is None:
-            # Simulation not actively streaming — send all stored steps
-            if last_step == 0:
-                all_steps = await service.get_simulation_steps(sim_id, skip=0, limit=50000)
-                for step in all_steps:
-                    step_data = SimulationStepResponse.from_entity(step)
-                    yield {
-                        "event": "step",
-                        "data": step_data.model_dump_json(by_alias=True),
-                    }
+            try:
+                while True:
+                    try:
+                        event = await asyncio.wait_for(queue.get(), timeout=30.0)
+                    except asyncio.TimeoutError:
+                        # Send keepalive ping
+                        yield {"event": "ping", "data": ""}
+                        continue
 
-            yield {"event": "complete", "data": json.dumps({"status": simulation.status.value})}
-            return
+                    if event["type"] == "step":
+                        step_json = event["data"]
+                        # data is already serialized JSON from the runner via DTO
+                        # Parse step number to check for reconnection skip
+                        step_num = json.loads(step_json).get("step", 0)
+                        if step_num <= last_step:
+                            continue
+                        yield {"event": "step", "data": step_json}
+                        await asyncio.sleep(0)
 
-        try:
-            while True:
-                try:
-                    event = await asyncio.wait_for(queue.get(), timeout=30.0)
-                except asyncio.TimeoutError:
-                    # Send keepalive
-                    yield {"event": "ping", "data": ""}
+                    elif event["type"] == "complete":
+                        yield {"event": "complete", "data": json.dumps(event["data"])}
+                        return
+
+                    elif event["type"] == "error":
+                        yield {"event": "error", "data": json.dumps(event["data"])}
+                        return
+
+            finally:
+                simulation_registry.unsubscribe(sim_id, queue)
+                logger.info("SSE client unsubscribed from simulation %s", simulation_id)
+
+        else:
+            # Simulation already completed or not in memory — replay from DB
+            # Uses the same SSEStepResponse DTO for consistent output shape
+            logger.info("Replaying simulation %s from DB (last_step=%d)", simulation_id, last_step)
+
+            all_steps = await service.get_simulation_steps(sim_id, skip=0, limit=50000)
+
+            for step in all_steps:
+                if step.step_number <= last_step:
                     continue
+                sse_step = SSEStepResponse.from_entity(step, simulation.dataset_row_count)
+                yield {"event": "step", "data": sse_step.model_dump_json(by_alias=True)}
+                await asyncio.sleep(0)
 
-                if event == STREAM_COMPLETE:
-                    yield {"event": "complete", "data": json.dumps({"status": "COMPLETED"})}
-                    break
-
-                if isinstance(event, dict) and event.get("type") == STREAM_ERROR:
-                    yield {
-                        "event": "error",
-                        "data": json.dumps({"error": event["error"]}),
-                    }
-                    continue
-
-                # Regular step event — skip if already replayed
-                if isinstance(event, dict) and event.get("step", 0) <= last_step:
-                    continue
-
-                yield {
-                    "event": "step",
-                    "data": json.dumps(event),
-                }
-        finally:
-            await stream_manager.unsubscribe(sim_id, queue)
+            # Fetch final status
+            sim = await service.get_simulation(sim_id)
+            yield {"event": "complete", "data": json.dumps({"status": sim.status.value})}
 
     return EventSourceResponse(event_generator())
 
@@ -208,14 +202,10 @@ async def list_simulations(
     service: SimulationService = Depends(get_simulation_service),
     current_user: User = Depends(get_current_user),
 ):
-    """List all simulations with pagination."""
     simulations, total = await service.get_simulations(page=page, page_size=page_size)
-
     return PaginatedResponse.ok(
         value=[SimulationResponse.from_entity(s) for s in simulations],
-        page=page,
-        total=total,
-        page_size=page_size,
+        page=page, total=total, page_size=page_size,
         message=f"Found {total} simulations",
     )
 
@@ -226,15 +216,9 @@ async def get_simulation(
     service: SimulationService = Depends(get_simulation_service),
     current_user: User = Depends(get_current_user),
 ):
-    """Get simulation details with final aggregates."""
     from uuid import UUID as UUIDType
-
     simulation = await service.get_simulation(UUIDType(simulation_id))
-
-    return ApiResponse.ok(
-        value=SimulationResponse.from_entity(simulation),
-        message="Simulation retrieved",
-    )
+    return ApiResponse.ok(value=SimulationResponse.from_entity(simulation), message="Simulation retrieved")
 
 
 @router.get("/{simulation_id}/steps")
@@ -245,13 +229,8 @@ async def get_simulation_steps(
     service: SimulationService = Depends(get_simulation_service),
     current_user: User = Depends(get_current_user),
 ):
-    """Get stored simulation steps (for replay or analysis)."""
     from uuid import UUID as UUIDType
-
-    steps = await service.get_simulation_steps(
-        UUIDType(simulation_id), skip=skip, limit=limit
-    )
-
+    steps = await service.get_simulation_steps(UUIDType(simulation_id), skip=skip, limit=limit)
     return ApiResponse.ok(
         value=[SimulationStepResponse.from_entity(s) for s in steps],
         message=f"Retrieved {len(steps)} steps",
@@ -264,12 +243,6 @@ async def delete_simulation(
     service: SimulationService = Depends(get_simulation_service),
     current_user: User = Depends(get_current_user),
 ):
-    """Delete a simulation and all its steps. Cannot delete running simulations."""
     from uuid import UUID as UUIDType
-
     await service.delete_simulation(UUIDType(simulation_id))
-
-    return ApiResponse.ok(
-        value=None,
-        message="Simulation deleted",
-    )
+    return ApiResponse.ok(value=None, message="Simulation deleted")
