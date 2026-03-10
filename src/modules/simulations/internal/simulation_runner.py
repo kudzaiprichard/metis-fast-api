@@ -8,7 +8,12 @@ batch-persists steps to the database.
 Architecture:
     POST /simulations → creates simulation + launches background task
     GET  /simulations/{id}/stream → subscribes to the queue via SSE
+    POST /simulations/{id}/cancel → cancels a running simulation
     Background task → computes steps, pushes to queue, persists to DB
+
+NOTE: The simulation registry is process-local. It will not survive
+process restarts or scale across multiple workers. If horizontal scaling
+is needed, replace with Redis pub/sub or similar distributed mechanism.
 """
 
 import csv
@@ -16,6 +21,7 @@ import io
 import json
 import logging
 import asyncio
+import time
 import warnings
 import numpy as np
 from typing import Dict, List, AsyncIterator
@@ -47,6 +53,10 @@ DB_BATCH_SIZE = 100
 PROGRESS_UPDATE_INTERVAL = 100
 MAX_DB_FLUSH_FAILURES = 3
 
+# Registry TTL: entries older than this are swept even if not cleaned up.
+# Guards against leaked entries from crashed tasks.
+REGISTRY_TTL_SECONDS = 3600  # 1 hour
+
 FEATURE_RANGES = {
     "age": (18, 120), "bmi": (10.0, 80.0), "hba1c_baseline": (3.0, 20.0),
     "egfr": (5.0, 200.0), "diabetes_duration": (0.0, 60.0),
@@ -68,6 +78,9 @@ class SimulationRegistry:
     Tracks running simulations and their event queues.
     SSE clients subscribe by getting a queue for a simulation ID.
     Multiple clients can subscribe to the same simulation.
+
+    NOTE: Process-local only. Will not work across multiple workers.
+    For horizontal scaling, replace with Redis pub/sub or similar.
     """
 
     def __init__(self):
@@ -78,7 +91,16 @@ class SimulationRegistry:
             "subscribers": [],
             "history": [],
             "completed": False,
+            "cancelled": False,
+            "task": None,
+            "registered_at": time.monotonic(),
         }
+
+    def set_task(self, simulation_id: UUID, task: asyncio.Task) -> None:
+        """Store the asyncio.Task so we can cancel it later."""
+        sim = self._simulations.get(simulation_id)
+        if sim:
+            sim["task"] = task
 
     def is_registered(self, simulation_id: UUID) -> bool:
         return simulation_id in self._simulations
@@ -87,11 +109,30 @@ class SimulationRegistry:
         sim = self._simulations.get(simulation_id)
         return sim["completed"] if sim else True
 
-    def subscribe(self, simulation_id: UUID) -> asyncio.Queue:
+    def is_cancelled(self, simulation_id: UUID) -> bool:
+        sim = self._simulations.get(simulation_id)
+        return sim["cancelled"] if sim else False
+
+    def cancel(self, simulation_id: UUID) -> bool:
+        """
+        Request cancellation of a running simulation.
+        Sets the cancelled flag (checked by the run loop) and cancels the asyncio.Task.
+        Returns True if the simulation was found and cancellation was requested.
+        """
+        sim = self._simulations.get(simulation_id)
+        if not sim or sim["completed"]:
+            return False
+        sim["cancelled"] = True
+        task = sim.get("task")
+        if task and not task.done():
+            task.cancel()
+        return True
+
+    def subscribe(self, simulation_id: UUID) -> asyncio.Queue | None:
         sim = self._simulations.get(simulation_id)
         if not sim:
             return None
-        q = asyncio.Queue(maxsize=1000)
+        q: asyncio.Queue = asyncio.Queue(maxsize=1000)
         # Replay history for late-joining clients
         for event in sim["history"]:
             q.put_nowait(event)
@@ -124,6 +165,23 @@ class SimulationRegistry:
 
     def cleanup(self, simulation_id: UUID) -> None:
         self._simulations.pop(simulation_id, None)
+
+    def sweep_stale(self) -> int:
+        """
+        Remove registry entries older than REGISTRY_TTL_SECONDS.
+        Call this periodically (e.g. from a background task or before register)
+        to prevent memory leaks from orphaned entries.
+        Returns the number of entries swept.
+        """
+        now = time.monotonic()
+        stale = [
+            sid for sid, data in self._simulations.items()
+            if now - data["registered_at"] > REGISTRY_TTL_SECONDS
+        ]
+        for sid in stale:
+            logger.warning("Sweeping stale simulation registry entry: %s", sid)
+            self._simulations.pop(sid, None)
+        return len(stale)
 
 
 # Global singleton
@@ -249,6 +307,10 @@ def _compute_step(patient, epsilon, model, pipeline, rng):
     Runs in a thread via asyncio.to_thread so the event loop stays free.
     Uses per-simulation rng instead of global np.random to avoid
     cross-contamination between concurrent simulations.
+
+    IMPORTANT: This function mutates `model` via update_posterior().
+    This is safe because steps are executed sequentially (one await per step).
+    Do NOT parallelize step execution without adding a lock around model access.
     """
     x = pipeline.transform_single(patient)
 
@@ -278,7 +340,7 @@ def _compute_step(patient, epsilon, model, pipeline, rng):
     safety_all = run_safety_checks(patient)
     safety_for_selected = get_safety_for_recommended(safety_all, selected_treatment)
 
-    # Update posterior inside the thread
+    # Update posterior inside the thread — safe because steps run sequentially.
     model.update_posterior(x, selected_idx, observed_reward)
 
     return {
@@ -321,8 +383,14 @@ async def run_simulation(
     3. For each patient: compute step in thread pool, publish to subscribers, buffer for DB
     4. Batch-persist to DB every DB_BATCH_SIZE steps
     5. On completion: save final aggregates, mark COMPLETED, cleanup registry
+    6. On cancellation: flush remaining steps, mark CANCELLED, cleanup registry
     """
     logger.info("Simulation %s starting (n=%d)", simulation_id, len(patients))
+
+    # Sweep stale entries before registering a new one
+    swept = simulation_registry.sweep_stale()
+    if swept:
+        logger.info("Swept %d stale registry entries", swept)
 
     # Register for SSE subscribers
     simulation_registry.register(simulation_id)
@@ -356,6 +424,33 @@ async def run_simulation(
         db_flush_failures = 0
 
         for i in range(n_patients):
+            # ── Check for cancellation ──
+            if simulation_registry.is_cancelled(simulation_id):
+                logger.info("Simulation %s cancelled at step %d/%d", simulation_id, i + 1, n_patients)
+
+                # Flush any buffered steps before marking cancelled
+                if step_buffer:
+                    try:
+                        await _flush_to_db(simulation_id, step_buffer, i)
+                        step_buffer.clear()
+                    except Exception as e:
+                        logger.error("Failed to flush steps on cancel: %s", e)
+
+                # Mark cancelled in DB
+                async with async_session() as session:
+                    async with session.begin():
+                        repo = SimulationRepository(session)
+                        await repo.update_status(simulation_id, SimulationStatus.CANCELLED)
+
+                # Notify subscribers
+                await simulation_registry.publish(simulation_id, {
+                    "type": "complete",
+                    "data": {"status": "CANCELLED", "cancelled_at_step": i},
+                })
+                simulation_registry.mark_completed(simulation_id)
+                simulation_registry.cleanup(simulation_id)
+                return
+
             patient = patients[i]
             epsilon = max(min_epsilon, initial_epsilon * (epsilon_decay ** (i + 1)))
 
@@ -469,8 +564,6 @@ async def run_simulation(
                 )
 
             # ── Publish lean SSE payload via DTO ──
-            # Full step data is persisted to DB and available via
-            # GET /simulations/{id}/steps for drill-down views.
             sse_step = SSEStepResponse.from_runner({
                 "step": i + 1,
                 "total_steps": n_patients,
@@ -546,15 +639,31 @@ async def run_simulation(
             "data": {"status": "COMPLETED", **final},
         })
         simulation_registry.mark_completed(simulation_id)
-
-        # ── Free registry memory now that sim is done ──
-        # Completed data is in DB; late clients replay from there.
         simulation_registry.cleanup(simulation_id)
 
         logger.info(
             "Simulation %s completed: accuracy=%.4f, reward=%.4f, regret=%.4f",
             simulation_id, running_accuracy, cumulative_reward, cumulative_regret,
         )
+
+    except asyncio.CancelledError:
+        # Task was cancelled externally (e.g. via cancel endpoint)
+        logger.info("Simulation %s task cancelled via asyncio", simulation_id)
+
+        await simulation_registry.publish(simulation_id, {
+            "type": "complete",
+            "data": {"status": "CANCELLED"},
+        })
+        simulation_registry.mark_completed(simulation_id)
+        simulation_registry.cleanup(simulation_id)
+
+        try:
+            async with async_session() as session:
+                async with session.begin():
+                    repo = SimulationRepository(session)
+                    await repo.update_status(simulation_id, SimulationStatus.CANCELLED)
+        except Exception:
+            logger.exception("Failed to update simulation status on cancel")
 
     except Exception as e:
         logger.exception("Simulation %s failed: %s", simulation_id, e)
@@ -565,8 +674,6 @@ async def run_simulation(
             "data": {"error": str(e)},
         })
         simulation_registry.mark_completed(simulation_id)
-
-        # ── Free registry memory on failure too ──
         simulation_registry.cleanup(simulation_id)
 
         try:
