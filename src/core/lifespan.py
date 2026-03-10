@@ -11,7 +11,6 @@ logger = logging.getLogger(__name__)
 
 
 def _setup_logging() -> None:
-    """Configure logging from application.yaml settings."""
     log_dir = os.path.dirname(log_config.file_path)
     if log_dir and not os.path.exists(log_dir):
         os.makedirs(log_dir)
@@ -30,7 +29,6 @@ def _setup_logging() -> None:
 
 
 def _load_models() -> None:
-    """Load ML models into the registry at startup."""
     from src.modules.models.internal.model_loader import registry
 
     registry.load(
@@ -38,46 +36,37 @@ def _load_models() -> None:
         model_file=model_config.model_file,
         pipeline_file=model_config.pipeline_file,
     )
-    # Future models:
-    # registry.load(
-    #     name="v2",
-    #     model_file="neural_thompson_v2.pt",
-    #     pipeline_file="feature_pipeline_v2.joblib",
-    # )
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    # Startup
+    # ── Startup ──
     _setup_logging()
     logger.info("Starting up — logging and DB pool initialised")
 
-    # Load ML models into memory
     try:
         _load_models()
         logger.info("ML models loaded into memory")
     except Exception as e:
         logger.error("Failed to load ML models: %s", e)
 
-    # Seed default admin
     from src.modules.auth.internal.admin_seeder import seed_admin
     try:
         await seed_admin()
     except Exception as e:
         logger.error("Admin seeding failed: %s", e)
 
-    # Start background token cleanup
     from src.modules.auth.internal.token_cleanup import start_token_cleanup
     cleanup_task = asyncio.create_task(start_token_cleanup())
 
     yield
 
-    # Cancel cleanup on shutdown
+    # ── Shutdown ──
     cleanup_task.cancel()
     try:
         await cleanup_task
     except asyncio.CancelledError:
         pass
-    # Shutdown
+
     await engine.dispose()
     logger.info("Shutting down — DB pool disposed")
