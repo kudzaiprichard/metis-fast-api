@@ -131,6 +131,25 @@ class SimulationService:
         logger.error("Simulation %s → FAILED: %s", simulation_id, error)
 
     async def mark_cancelled(self, simulation_id: UUID) -> None:
+        """
+        Mark a simulation as cancelled in the database.
+        Called as a fallback when the simulation is no longer in the
+        in-memory registry (e.g. it finished between the status check
+        and the cancel request).
+        """
+        simulation = await self.get_simulation(simulation_id)
+
+        if simulation.status not in (SimulationStatus.RUNNING, SimulationStatus.PENDING):
+            raise ConflictException(
+                message="Only running or pending simulations can be cancelled",
+                error_detail=ErrorDetail(
+                    title="Conflict",
+                    code="SIMULATION_NOT_CANCELLABLE",
+                    status=409,
+                    details=[f"Simulation status is '{simulation.status.value}'"],
+                ),
+            )
+
         await self.simulation_repo.update_status(simulation_id, SimulationStatus.CANCELLED)
         logger.info("Simulation %s → CANCELLED", simulation_id)
 
