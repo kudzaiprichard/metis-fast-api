@@ -6,7 +6,7 @@ from fastapi import APIRouter, Depends, UploadFile, File, Form, Query
 from sse_starlette.sse import EventSourceResponse
 
 from src.shared.responses import ApiResponse, PaginatedResponse, ErrorDetail
-from src.shared.exceptions import BadRequestException
+from src.shared.exceptions import BadRequestException, ConflictException
 from src.modules.auth.presentation.dependencies import get_current_user
 from src.modules.auth.domain.models.user import User
 from src.modules.simulations.presentation.dependencies import (
@@ -14,6 +14,7 @@ from src.modules.simulations.presentation.dependencies import (
     get_simulation_service,
 )
 from src.modules.simulations.domain.services.simulation_service import SimulationService
+from src.modules.simulations.domain.models.enums import SimulationStatus
 from src.modules.simulations.presentation.dtos.responses import (
     SimulationResponse,
     SimulationStepResponse,
@@ -28,6 +29,9 @@ from src.modules.simulations.internal.simulation_runner import (
 logger = logging.getLogger(__name__)
 
 router = APIRouter(dependencies=[Depends(require_admin)])
+
+# Chunk size for DB replay in SSE stream
+REPLAY_CHUNK_SIZE = 500
 
 
 @router.post("")
@@ -97,6 +101,9 @@ async def start_simulation(
         name=f"simulation-{simulation.id}",
     )
 
+    # Store task reference in registry so cancel endpoint can reach it
+    simulation_registry.set_task(simulation.id, task)
+
     def _on_done(t: asyncio.Task) -> None:
         if t.cancelled():
             logger.info("Simulation task cancelled: %s", simulation.id)
@@ -122,7 +129,7 @@ async def stream_simulation(
     SSE endpoint — streams simulation steps in real-time.
 
     If the simulation is still running, subscribes to the in-memory queue.
-    If the simulation is completed, replays from the database.
+    If the simulation is completed, replays from the database in chunks.
     Supports reconnection via last_step parameter.
 
     Both paths use SSEStepResponse DTO for consistent output shape.
@@ -133,14 +140,13 @@ async def stream_simulation(
     simulation = await service.get_simulation(sim_id)
 
     async def event_generator():
-        # Check if simulation is still running in-memory
-        if simulation_registry.is_registered(sim_id) and not simulation_registry.is_completed(sim_id):
-            # Subscribe to live events
-            queue = simulation_registry.subscribe(sim_id)
-            if queue is None:
-                yield {"event": "error", "data": json.dumps({"error": "Failed to subscribe"})}
-                return
+        # Snapshot registry state atomically to avoid race condition where
+        # the simulation completes between is_registered and subscribe calls.
+        is_live = simulation_registry.is_registered(sim_id) and not simulation_registry.is_completed(sim_id)
+        queue = simulation_registry.subscribe(sim_id) if is_live else None
 
+        if queue is not None:
+            # ── Live path: subscribe to in-memory queue ──
             logger.info("SSE client subscribed to live simulation %s", simulation_id)
 
             try:
@@ -148,14 +154,11 @@ async def stream_simulation(
                     try:
                         event = await asyncio.wait_for(queue.get(), timeout=30.0)
                     except asyncio.TimeoutError:
-                        # Send keepalive ping
                         yield {"event": "ping", "data": ""}
                         continue
 
                     if event["type"] == "step":
                         step_json = event["data"]
-                        # data is already serialized JSON from the runner via DTO
-                        # Parse step number to check for reconnection skip
                         step_num = json.loads(step_json).get("step", 0)
                         if step_num <= last_step:
                             continue
@@ -175,24 +178,76 @@ async def stream_simulation(
                 logger.info("SSE client unsubscribed from simulation %s", simulation_id)
 
         else:
-            # Simulation already completed or not in memory — replay from DB
-            # Uses the same SSEStepResponse DTO for consistent output shape
+            # ── Replay path: stream from DB in chunks ──
+            # If we raced (sim completed between check and subscribe), we
+            # fall through here safely and replay from the database.
             logger.info("Replaying simulation %s from DB (last_step=%d)", simulation_id, last_step)
 
-            all_steps = await service.get_simulation_steps(sim_id, skip=0, limit=50000)
+            skip = last_step
+            while True:
+                chunk = await service.get_simulation_steps(sim_id, skip=skip, limit=REPLAY_CHUNK_SIZE)
+                if not chunk:
+                    break
 
-            for step in all_steps:
-                if step.step_number <= last_step:
-                    continue
-                sse_step = SSEStepResponse.from_entity(step, simulation.dataset_row_count)
-                yield {"event": "step", "data": sse_step.model_dump_json(by_alias=True)}
-                await asyncio.sleep(0)
+                for step in chunk:
+                    if step.step_number <= last_step:
+                        continue
+                    sse_step = SSEStepResponse.from_entity(step, simulation.dataset_row_count)
+                    yield {"event": "step", "data": sse_step.model_dump_json(by_alias=True)}
+                    await asyncio.sleep(0)
+
+                # If we got fewer than the chunk size, we've reached the end
+                if len(chunk) < REPLAY_CHUNK_SIZE:
+                    break
+
+                skip += len(chunk)
 
             # Fetch final status
             sim = await service.get_simulation(sim_id)
             yield {"event": "complete", "data": json.dumps({"status": sim.status.value})}
 
     return EventSourceResponse(event_generator())
+
+
+@router.post("/{simulation_id}/cancel")
+async def cancel_simulation(
+    simulation_id: str,
+    service: SimulationService = Depends(get_simulation_service),
+    current_user: User = Depends(get_current_user),
+):
+    """
+    Cancel a running simulation.
+
+    Sets the cancellation flag in the registry so the run loop exits gracefully.
+    Also cancels the asyncio.Task as a fallback.
+    """
+    from uuid import UUID as UUIDType
+
+    sim_id = UUIDType(simulation_id)
+    simulation = await service.get_simulation(sim_id)
+
+    if simulation.status != SimulationStatus.RUNNING:
+        raise ConflictException(
+            message="Only running simulations can be cancelled",
+            error_detail=ErrorDetail(
+                title="Conflict",
+                code="SIMULATION_NOT_RUNNING",
+                status=409,
+                details=[f"Simulation status is '{simulation.status.value}'"],
+            ),
+        )
+
+    cancelled = simulation_registry.cancel(sim_id)
+    if not cancelled:
+        # Not in registry (maybe already finished) — mark in DB directly
+        await service.mark_cancelled(sim_id)
+
+    # Re-fetch to return updated state
+    simulation = await service.get_simulation(sim_id)
+    return ApiResponse.ok(
+        value=SimulationResponse.from_entity(simulation),
+        message="Simulation cancellation requested",
+    )
 
 
 @router.get("")
