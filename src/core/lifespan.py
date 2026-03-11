@@ -4,6 +4,8 @@ import logging
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from src.shared.database.engine import engine
+from src.shared.neo4j import connect, close as close_neo4j
+from src.configs import neo4j as neo4j_config
 from src.configs import logging as log_config, model as model_config
 
 
@@ -50,6 +52,13 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("Failed to load ML models: %s", e)
 
+    # Neo4j
+    try:
+        connect(neo4j_config.uri, neo4j_config.username, neo4j_config.password)
+        logger.info("Neo4j connected")
+    except Exception as e:
+        logger.error("Neo4j connection failed: %s", e)
+
     from src.modules.auth.internal.admin_seeder import seed_admin
     try:
         await seed_admin()
@@ -67,6 +76,9 @@ async def lifespan(app: FastAPI):
         await cleanup_task
     except asyncio.CancelledError:
         pass
+
+    close_neo4j()
+    logger.info("Neo4j connection closed")
 
     await engine.dispose()
     logger.info("Shutting down — DB pool disposed")
