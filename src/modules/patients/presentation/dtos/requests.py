@@ -1,7 +1,8 @@
 from datetime import date
 from typing import Optional
+from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, EmailStr, Field, model_validator
 
 
 # ── Patient DTOs ──
@@ -46,3 +47,36 @@ class CreateMedicalRecordRequest(BaseModel):
     triglycerides: float = Field(ge=30, le=800)
     alt: float = Field(ge=5, le=500)
     notes: Optional[str] = Field(None, max_length=1000)
+
+
+# ── Similar Patient DTOs ──
+
+class FindSimilarPatientsRequest(BaseModel):
+    """Find similar patients in tabular format with pagination."""
+    patient_id: Optional[UUID] = Field(None, description="Uses latest medical record")
+    medical_record_id: Optional[UUID] = Field(None, description="Uses specific medical record")
+    limit: int = Field(default=20, ge=1, le=100, description="Max total matches from Neo4j")
+    page: int = Field(default=1, ge=1, description="Page number")
+    page_size: int = Field(default=10, ge=1, le=50, description="Results per page")
+    treatment_filter: Optional[str] = None
+    min_similarity: float = Field(default=0.5, ge=0.0, le=1.0)
+
+    @model_validator(mode="after")
+    def require_at_least_one_id(self):
+        if not self.patient_id and not self.medical_record_id:
+            raise ValueError("Either 'patient_id' or 'medical_record_id' must be provided")
+        return self
+
+
+class FindSimilarPatientsGraphRequest(BaseModel):
+    """Find similar patients in graph format for visualization."""
+    patient_id: Optional[UUID] = Field(None, description="Uses latest medical record")
+    medical_record_id: Optional[UUID] = Field(None, description="Uses specific medical record")
+    limit: int = Field(default=5, ge=1, le=20)
+    treatment_filter: Optional[str] = None
+
+    @model_validator(mode="after")
+    def require_at_least_one_id(self):
+        if not self.patient_id and not self.medical_record_id:
+            raise ValueError("Either 'patient_id' or 'medical_record_id' must be provided")
+        return self
