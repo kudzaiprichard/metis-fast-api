@@ -1,6 +1,6 @@
 # Metis
 
-A modular FastAPI clinical decision support system for Type 2 Diabetes treatment selection. Uses a Contextual Bandit (Neural Thompson Sampling) to recommend personalised treatments, with async SQLAlchemy, JWT authentication, role-based access control, real-time simulation streaming via SSE, and a config system driven by YAML and environment variables.
+A modular FastAPI clinical decision support system for Type 2 Diabetes treatment selection. Uses a Contextual Bandit (Neural Thompson Sampling) to recommend personalised treatments, with async SQLAlchemy, JWT authentication, role-based access control, real-time simulation streaming via SSE, Neo4j-powered similar patient search, and a config system driven by YAML and environment variables.
 
 ---
 
@@ -13,6 +13,7 @@ A modular FastAPI clinical decision support system for Type 2 Diabetes treatment
 - [Module Structure](#module-structure)
 - [Auth Module](#auth-module)
 - [Patients Module](#patients-module)
+- [Similar Patients Module](#similar-patients-module)
 - [Models Module](#models-module)
 - [Predictions Module](#predictions-module)
 - [Simulations Module](#simulations-module)
@@ -48,6 +49,9 @@ A modular FastAPI clinical decision support system for Type 2 Diabetes treatment
 │   │   │   ├── base_model.py      # Base model (UUID pk, timestamps)
 │   │   │   ├── repository.py      # Generic CRUD repository
 │   │   │   └── dependencies.py    # get_db, get_db_readonly
+│   │   ├── neo4j/
+│   │   │   ├── __init__.py        # connect(), close(), get_neo4j_db()
+│   │   │   └── neo4j_graph_database.py  # Neo4j query layer
 │   │   ├── responses/
 │   │   │   ├── __init__.py
 │   │   │   └── api_response.py    # ApiResponse, PaginatedResponse, ErrorDetail
@@ -57,7 +61,7 @@ A modular FastAPI clinical decision support system for Type 2 Diabetes treatment
 │   │       └── error_handlers.py  # Global FastAPI error handlers
 │   └── modules/
 │       ├── auth/                  # Authentication & user management
-│       ├── patients/              # Patient records & medical data
+│       ├── patients/              # Patient records, medical data & similar patient search
 │       ├── models/                # ML inference (stateless)
 │       ├── predictions/           # Clinical workflow & decision tracking
 │       └── simulations/           # Bandit simulation with real-time SSE streaming
@@ -71,6 +75,7 @@ A modular FastAPI clinical decision support system for Type 2 Diabetes treatment
 
 - Python 3.11+
 - PostgreSQL
+- Neo4j 5.x+
 
 ### Installation
 
@@ -102,6 +107,7 @@ pandas
 loguru
 google-genai
 sse-starlette
+neo4j
 ```
 
 ### Environment
@@ -116,6 +122,7 @@ Required variables:
 - `DATABASE_URL` — PostgreSQL async connection string
 - `JWT_SECRET_KEY` — Secret key for JWT signing
 - `GEMINI_API_KEY` — Google Gemini API key for LLM explanations
+- `NEO4J_PASSWORD` — Neo4j database password
 
 ### Database
 
@@ -126,6 +133,19 @@ CREATE DATABASE metisdb;
 ```bash
 alembic upgrade head
 ```
+
+### Neo4j
+
+Ensure Neo4j is running locally (or update `NEO4J_URI` in `.env`):
+
+```bash
+# Default connection
+NEO4J_URI=neo4j://localhost:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=your-password
+```
+
+Neo4j stores the historical patient dataset used for similar patient search. The graph contains Patient, Treatment, Outcome, and Comorbidity nodes with relationships for treatment history, clinical outcomes, and condition associations.
 
 ### ML Model Files
 
@@ -145,8 +165,10 @@ On startup:
 1. Load and validate all configuration
 2. Generate IDE stubs for config autocomplete
 3. Initialize the database connection pool
-4. Seed a default admin user (if none exists)
-5. Start the background token cleanup task
+4. Load ML models into memory
+5. Connect to Neo4j graph database
+6. Seed a default admin user (if none exists)
+7. Start the background token cleanup task
 
 ---
 
@@ -165,12 +187,13 @@ Supported types: `str`, `int`, `float`, `bool`, `list` (comma-separated).
 Access config anywhere:
 
 ```python
-from src.configs import database, security, application, model, gemini
+from src.configs import database, security, application, model, gemini, neo4j
 
 database.url
 security.jwt.secret_key
 model.path
 gemini.api_key
+neo4j.uri
 ```
 
 ---
@@ -300,6 +323,90 @@ Medical data changes between visits — the patient doesn't. That's why they're 
 | POST | /{id}/medical-records | Add medical record |
 | GET | /{id}/medical-records | List medical records |
 | GET | /{id}/medical-records/{record_id} | Get single record |
+
+---
+
+## Similar Patients Module
+
+Finds clinically similar patient cases from a Neo4j historical dataset. Supports tabular results with pagination, graph-format results for visualization, and detailed case lookup.
+
+### How It Works
+
+1. Doctor provides a patient ID (uses latest medical record) or a specific medical record ID
+2. Service builds a clinical profile from the medical record (16 features)
+3. Neo4j runs a Cypher query with normalised feature matching and comorbidity overlap scoring
+4. Similarity is calculated as 70% clinical feature distance + 30% comorbidity Jaccard index
+5. Results are returned in tabular format (paginated) or graph format (nodes + edges for visualization)
+
+### Similarity Algorithm
+
+The matching algorithm uses two components:
+
+- **Clinical similarity (70% weight)** — Normalised distance across 6 key features: age, HbA1c, C-peptide, BMI, eGFR, and diabetes duration. Each feature is normalised by its clinical range to ensure equal weighting.
+- **Comorbidity similarity (30% weight)** — Jaccard index comparing the patient's comorbidities (hypertension, CKD, CVD, NAFLD, retinopathy) against historical cases.
+
+Pre-filtering narrows candidates by age group and HbA1c severity before distance calculation. Optional treatment filtering allows targeted comparisons (e.g., only Metformin cases).
+
+### Graph Format
+
+The graph endpoint returns a structure suitable for visualization libraries (D3.js, Cytoscape):
+
+- **Nodes** — Query patient (centre), similar patients, treatments, outcomes. Each with type, data payload, and visual styling (color, size, shape).
+- **Edges** — SIMILAR_TO (with similarity %), RECEIVED_TREATMENT, RESULTED_IN (with HbA1c reduction). Each with styling (width, color).
+- **Metadata** — Filters applied, results count, similarity range statistics.
+
+### Neo4j Graph Schema
+
+```
+(Patient)-[:RECEIVED_TREATMENT]->(Treatment)
+(Patient)-[:HAS_CONDITION]->(Comorbidity)
+(Outcome {patient_id})-[linked by patient_id]
+```
+
+Each Patient node contains demographic and clinical properties. Outcome nodes store treatment results (HbA1c reduction, follow-up values, adverse events, success classification).
+
+### Endpoints (`/api/v1/similar-patients`) — DOCTOR
+
+| Method | Path | Description |
+|--------|------|-------------|
+| POST | /search | Find similar patients (paginated) |
+| POST | /search/graph | Find similar patients (graph format) |
+| GET | /{case_id} | Get full details of a historical case |
+
+### Request Format
+
+**POST /search**
+
+```json
+{
+  "patientId": "uuid",
+  "limit": 20,
+  "page": 1,
+  "pageSize": 10,
+  "treatmentFilter": "Metformin",
+  "minSimilarity": 0.5
+}
+```
+
+**POST /search/graph**
+
+```json
+{
+  "patientId": "uuid",
+  "limit": 5,
+  "treatmentFilter": null
+}
+```
+
+Either `patientId` (uses latest medical record) or `medicalRecordId` (uses that specific record) must be provided. If both are given, `medicalRecordId` takes priority.
+
+### Key Design Decisions
+
+- **Neo4j for graph queries** — Cypher enables efficient traversal-based similarity matching with comorbidity overlap, something that would require complex joins in PostgreSQL
+- **Sync Neo4j driver wrapped in `asyncio.to_thread()`** — The official Neo4j Python driver is synchronous; wrapping in `to_thread` keeps the FastAPI event loop non-blocking
+- **No Neo4j manager class** — Unlike Flask's app context pattern, FastAPI uses a simple module-level instance managed by the lifespan (connect on startup, close on shutdown) and exposed via `Depends(get_neo4j_db)`
+- **Pagination on tabular results** — Neo4j returns up to `limit` total matches, then the controller slices by `page` and `pageSize` for frontend consumption
+- **Response DTOs with camelCase aliases** — Consistent with the rest of the FastAPI API; `from_dict()` static methods map Neo4j's snake_case output to camelCase JSON
 
 ---
 
@@ -570,6 +677,8 @@ app.include_router(appointment_router, prefix="/api/v1/appointments", tags=["App
 The shared layer provides reusable building blocks. It never imports from any module.
 
 **Database** — `BaseModel` (UUID pk, created_at, updated_at), `BaseRepository` (CRUD, pagination, filtering), `get_db` / `get_db_readonly` session dependencies.
+
+**Neo4j** — Module-level singleton managed by lifespan. `connect(uri, username, password)` on startup, `close()` on shutdown, `get_neo4j_db()` as FastAPI dependency. Contains `Neo4jGraphDatabase` with methods for similar patient search (tabular + graph), patient detail lookup, clinical guidelines, contraindication checking, and SHAP background data.
 
 **Responses** — `ApiResponse` for single results, `PaginatedResponse` for lists, `ErrorDetail` with builder pattern for structured errors.
 
