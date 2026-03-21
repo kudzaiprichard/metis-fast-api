@@ -4,6 +4,7 @@ from typing import Optional
 from fastapi import APIRouter, Depends, Query
 
 from src.shared.responses import ApiResponse, PaginatedResponse
+from src.shared.database.pagination import PaginationParams, get_pagination
 from src.modules.auth.domain.models.user import User
 from src.modules.auth.domain.services.user_management_service import UserManagementService
 from src.modules.auth.presentation.dependencies import (
@@ -18,20 +19,19 @@ router = APIRouter(dependencies=[Depends(require_admin)])
 
 @router.get("")
 async def get_users(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
+    pagination: PaginationParams = Depends(get_pagination),
     role: Optional[str] = Query(None, pattern="^(ADMIN|DOCTOR)$"),
     is_active: Optional[bool] = None,
     service: UserManagementService = Depends(get_user_management_service),
 ):
     users, total = await service.get_users(
-        page=page, page_size=page_size, role=role, is_active=is_active
+        page=pagination.page, page_size=pagination.page_size, role=role, is_active=is_active
     )
     return PaginatedResponse.ok(
         value=[UserResponse.from_user(u) for u in users],
-        page=page,
+        page=pagination.page,
         total=total,
-        page_size=page_size,
+        page_size=pagination.page_size,
     )
 
 

@@ -1,8 +1,9 @@
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends
 
 from src.shared.responses import ApiResponse, PaginatedResponse
+from src.shared.database.pagination import PaginationParams, get_pagination
 from src.modules.auth.presentation.dependencies import get_current_user, require_role
 from src.modules.auth.domain.models.enums import Role
 from src.modules.auth.domain.models.user import User
@@ -67,17 +68,16 @@ async def record_decision(
 @router.get("/patient/{patient_id}")
 async def get_patient_predictions(
     patient_id: UUID,
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
+    pagination: PaginationParams = Depends(get_pagination),
     service: PredictionService = Depends(get_prediction_service),
 ):
     """Get prediction history for a patient."""
     predictions, total = await service.get_patient_predictions(
-        patient_id=patient_id, page=page, page_size=page_size,
+        patient_id=patient_id, page=pagination.page, page_size=pagination.page_size,
     )
     return PaginatedResponse.ok(
         value=[PredictionResponse.from_prediction(p) for p in predictions],
-        page=page,
+        page=pagination.page,
         total=total,
-        page_size=page_size,
+        page_size=pagination.page_size,
     )

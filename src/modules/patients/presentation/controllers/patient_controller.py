@@ -3,6 +3,7 @@ from uuid import UUID
 from fastapi import APIRouter, Depends, Query
 
 from src.shared.responses import ApiResponse, PaginatedResponse
+from src.shared.database.pagination import PaginationParams, get_pagination
 from src.modules.auth.presentation.dependencies import get_current_user, require_role
 from src.modules.auth.domain.models.enums import Role
 from src.modules.auth.domain.models.user import User
@@ -43,16 +44,15 @@ async def create_patient(
 
 @router.get("")
 async def get_patients(
-    page: int = Query(1, ge=1),
-    page_size: int = Query(20, ge=1, le=100),
+    pagination: PaginationParams = Depends(get_pagination),
     service: PatientService = Depends(get_patient_service),
 ):
-    patients, total = await service.get_patients(page=page, page_size=page_size)
+    patients, total = await service.get_patients(page=pagination.page, page_size=pagination.page_size)
     return PaginatedResponse.ok(
         value=[PatientResponse.from_patient(p) for p in patients],
-        page=page,
+        page=pagination.page,
         total=total,
-        page_size=page_size,
+        page_size=pagination.page_size,
     )
 
 

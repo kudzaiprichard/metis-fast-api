@@ -6,6 +6,7 @@ from fastapi import APIRouter, Depends, UploadFile, File, Form, Query
 from sse_starlette.sse import EventSourceResponse
 
 from src.shared.responses import ApiResponse, PaginatedResponse, ErrorDetail
+from src.shared.database.pagination import PaginationParams, get_pagination
 from src.shared.exceptions import BadRequestException, ConflictException
 from src.modules.auth.presentation.dependencies import get_current_user
 from src.modules.auth.domain.models.user import User
@@ -87,7 +88,6 @@ async def start_simulation(
         reset_posterior=reset_posterior,
     )
 
-    # Launch simulation as background task — runs in this process
     task = asyncio.create_task(
         run_simulation(
             simulation_id=simulation.id,
@@ -101,7 +101,6 @@ async def start_simulation(
         name=f"simulation-{simulation.id}",
     )
 
-    # Store task reference in registry so cancel endpoint can reach it
     simulation_registry.set_task(simulation.id, task)
 
     def _on_done(t: asyncio.Task) -> None:
@@ -125,28 +124,16 @@ async def stream_simulation(
     service: SimulationService = Depends(get_simulation_service),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    SSE endpoint — streams simulation steps in real-time.
-
-    If the simulation is still running, subscribes to the in-memory queue.
-    If the simulation is completed, replays from the database in chunks.
-    Supports reconnection via last_step parameter.
-
-    Both paths use SSEStepResponse DTO for consistent output shape.
-    """
     from uuid import UUID as UUIDType
 
     sim_id = UUIDType(simulation_id)
     simulation = await service.get_simulation(sim_id)
 
     async def event_generator():
-        # Snapshot registry state atomically to avoid race condition where
-        # the simulation completes between is_registered and subscribe calls.
         is_live = simulation_registry.is_registered(sim_id) and not simulation_registry.is_completed(sim_id)
         queue = simulation_registry.subscribe(sim_id) if is_live else None
 
         if queue is not None:
-            # ── Live path: subscribe to in-memory queue ──
             logger.info("SSE client subscribed to live simulation %s", simulation_id)
 
             try:
@@ -178,9 +165,6 @@ async def stream_simulation(
                 logger.info("SSE client unsubscribed from simulation %s", simulation_id)
 
         else:
-            # ── Replay path: stream from DB in chunks ──
-            # If we raced (sim completed between check and subscribe), we
-            # fall through here safely and replay from the database.
             logger.info("Replaying simulation %s from DB (last_step=%d)", simulation_id, last_step)
 
             skip = last_step
@@ -196,13 +180,11 @@ async def stream_simulation(
                     yield {"event": "step", "data": sse_step.model_dump_json(by_alias=True)}
                     await asyncio.sleep(0)
 
-                # If we got fewer than the chunk size, we've reached the end
                 if len(chunk) < REPLAY_CHUNK_SIZE:
                     break
 
                 skip += len(chunk)
 
-            # Fetch final status
             sim = await service.get_simulation(sim_id)
             yield {"event": "complete", "data": json.dumps({"status": sim.status.value})}
 
@@ -215,12 +197,6 @@ async def cancel_simulation(
     service: SimulationService = Depends(get_simulation_service),
     current_user: User = Depends(get_current_user),
 ):
-    """
-    Cancel a running simulation.
-
-    Sets the cancellation flag in the registry so the run loop exits gracefully.
-    Also cancels the asyncio.Task as a fallback.
-    """
     from uuid import UUID as UUIDType
 
     sim_id = UUIDType(simulation_id)
@@ -239,10 +215,8 @@ async def cancel_simulation(
 
     cancelled = simulation_registry.cancel(sim_id)
     if not cancelled:
-        # Not in registry (maybe already finished) — mark in DB directly
         await service.mark_cancelled(sim_id)
 
-    # Re-fetch to return updated state
     simulation = await service.get_simulation(sim_id)
     return ApiResponse.ok(
         value=SimulationResponse.from_entity(simulation),
@@ -252,15 +226,14 @@ async def cancel_simulation(
 
 @router.get("")
 async def list_simulations(
-    page: int = Query(default=1, ge=1),
-    page_size: int = Query(default=20, ge=1, le=100, alias="pageSize"),
+    pagination: PaginationParams = Depends(get_pagination),
     service: SimulationService = Depends(get_simulation_service),
     current_user: User = Depends(get_current_user),
 ):
-    simulations, total = await service.get_simulations(page=page, page_size=page_size)
+    simulations, total = await service.get_simulations(page=pagination.page, page_size=pagination.page_size)
     return PaginatedResponse.ok(
         value=[SimulationResponse.from_entity(s) for s in simulations],
-        page=page, total=total, page_size=page_size,
+        page=pagination.page, total=total, page_size=pagination.page_size,
         message=f"Found {total} simulations",
     )
 

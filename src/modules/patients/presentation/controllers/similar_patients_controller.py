@@ -6,6 +6,7 @@ Endpoints for finding and viewing similar patient cases from Neo4j.
 from fastapi import APIRouter, Depends
 
 from src.shared.responses import ApiResponse, PaginatedResponse
+from src.shared.database.pagination import PaginationParams, get_pagination
 from src.modules.auth.presentation.dependencies import require_role
 from src.modules.auth.domain.models.enums import Role
 from src.modules.patients.domain.services.similar_patient_service import SimilarPatientService
@@ -26,13 +27,12 @@ router = APIRouter(dependencies=[Depends(require_role(Role.DOCTOR))])
 @router.post("/search", status_code=200)
 async def find_similar_patients(
     body: FindSimilarPatientsRequest,
+    pagination: PaginationParams = Depends(get_pagination),
     service: SimilarPatientService = Depends(get_similar_patient_service),
 ):
     """
-    Find similar patient cases in tabular format with pagination.
-
-    Neo4j returns up to `limit` total matches, then results are
-    paginated by `page` and `page_size`.
+    Find similar patient cases in tabular format.
+    Search criteria in body, pagination via query params (?page=1&pageSize=10).
     """
     all_cases, patient_id = await service.find_similar_patients(
         patient_id=body.patient_id,
@@ -43,15 +43,15 @@ async def find_similar_patients(
     )
 
     total = len(all_cases)
-    start = (body.page - 1) * body.page_size
-    end = start + body.page_size
+    start = pagination.skip
+    end = start + pagination.page_size
     page_cases = all_cases[start:end]
 
     return PaginatedResponse.ok(
         value=[SimilarPatientCaseResponse.from_dict(c) for c in page_cases],
-        page=body.page,
+        page=pagination.page,
         total=total,
-        page_size=body.page_size,
+        page_size=pagination.page_size,
         message="Similar patients retrieved successfully",
     )
 

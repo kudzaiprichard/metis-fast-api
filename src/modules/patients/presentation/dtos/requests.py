@@ -52,12 +52,10 @@ class CreateMedicalRecordRequest(BaseModel):
 # ── Similar Patient DTOs ──
 
 class FindSimilarPatientsRequest(BaseModel):
-    """Find similar patients in tabular format with pagination."""
+    """Search criteria for finding similar patients. Pagination via query params."""
     patient_id: Optional[UUID] = Field(None, description="Uses latest medical record")
     medical_record_id: Optional[UUID] = Field(None, description="Uses specific medical record")
     limit: int = Field(default=20, ge=1, le=100, description="Max total matches from Neo4j")
-    page: int = Field(default=1, ge=1, description="Page number")
-    page_size: int = Field(default=10, ge=1, le=50, description="Results per page")
     treatment_filter: Optional[str] = None
     min_similarity: float = Field(default=0.5, ge=0.0, le=1.0)
 
