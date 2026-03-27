@@ -1,20 +1,10 @@
 from uuid import UUID
 from datetime import datetime
-from typing import Optional, Dict, List
+from typing import Any, Optional, Dict
 
 from pydantic import BaseModel, Field
 
 from src.modules.predictions.domain.models.prediction import Prediction
-
-
-class SafetyDetailResponse(BaseModel):
-    recommended_contraindications: List[str] = Field(alias="recommendedContraindications")
-    recommended_warnings: List[str] = Field(alias="recommendedWarnings")
-    excluded_treatments: Dict[str, List[str]] = Field(alias="excludedTreatments")
-    all_warnings: Dict[str, List[str]] = Field(alias="allWarnings")
-
-    class Config:
-        populate_by_name = True
 
 
 class ExplanationResponse(BaseModel):
@@ -46,12 +36,16 @@ class PredictionResponse(BaseModel):
     win_rates: Dict[str, float] = Field(alias="winRates")
     posterior_means: Dict[str, float] = Field(alias="posteriorMeans")
 
-    # Safety
+    # Safety — passthrough: old rows keep legacy keys (recommended_contraindications,
+    # recommended_warnings, all_warnings); new rows carry structured
+    # {safety_findings, excluded_treatments, override}. FE reads whichever shape it gets.
     safety_status: str = Field(alias="safetyStatus")
-    safety_details: SafetyDetailResponse = Field(alias="safetyDetails")
+    safety_details: Dict[str, Any] = Field(alias="safetyDetails")
 
-    # Fairness
-    fairness: dict
+    # Fairness — passthrough: old rows carry the legacy fairness block
+    # (decision_features etc.); new rows carry engine extras
+    # {model_top_treatment, attribution, contrast, uncertainty_drivers}.
+    fairness: Dict[str, Any]
 
     # Explanation
     explanation: ExplanationResponse
@@ -86,13 +80,8 @@ class PredictionResponse(BaseModel):
             winRates=prediction.win_rates,
             posteriorMeans=prediction.posterior_means,
             safetyStatus=prediction.safety_status,
-            safetyDetails=SafetyDetailResponse(
-                recommendedContraindications=prediction.safety_details["recommended_contraindications"],
-                recommendedWarnings=prediction.safety_details["recommended_warnings"],
-                excludedTreatments=prediction.safety_details["excluded_treatments"],
-                allWarnings=prediction.safety_details["all_warnings"],
-            ),
-            fairness=prediction.fairness,
+            safetyDetails=prediction.safety_details or {},
+            fairness=prediction.fairness or {},
             explanation=ExplanationResponse(
                 summary=prediction.explanation_summary,
                 runnerUp=prediction.explanation_runner_up,
