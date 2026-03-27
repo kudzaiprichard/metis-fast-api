@@ -1,22 +1,20 @@
 """
-Maps a MedicalRecord SQLAlchemy object to the context dict
-that the inference engine expects.
+Maps a MedicalRecord SQLAlchemy object to a validated PatientInput — the
+schema that the inference engine expects at its boundary.
 
 This is the single bridge between the database schema and the ML model.
-All 16 features are extracted by name — order doesn't matter.
+All 16 clinical features flow through; the four G-14 safety flags default
+to 0 because MedicalRecord does not yet carry them, and the audit fields
+(gender, ethnicity, patient_id) are deliberately omitted per G-15
+fairness posture.
 """
 
+from src.shared.inference import PatientInput
 from src.modules.patients.domain.models.medical_record import MedicalRecord
 
 
-def to_context(record: MedicalRecord) -> dict:
-    """
-    Convert a MedicalRecord to the 16-feature context dict.
-
-    Returns:
-        dict matching the keys expected by FeaturePipeline.transform_single()
-    """
-    return {
+def to_context(record: MedicalRecord) -> PatientInput:
+    return PatientInput.model_validate({
         "age": record.age,
         "bmi": record.bmi,
         "hba1c_baseline": record.hba1c_baseline,
@@ -33,4 +31,4 @@ def to_context(record: MedicalRecord) -> dict:
         "hdl": record.hdl,
         "triglycerides": record.triglycerides,
         "alt": record.alt,
-    }
+    })
