@@ -1,12 +1,13 @@
 from typing import Sequence, Tuple
 from uuid import UUID
 
+from src.shared.inference import InferenceEngine
 from src.modules.predictions.domain.models.prediction import Prediction
 from src.modules.predictions.domain.models.enums import DoctorDecision
 from src.modules.predictions.domain.repositories.prediction_repository import PredictionRepository
 from src.modules.predictions.internal.medical_record_mapper import to_context
+from src.modules.predictions.internal.prediction_mapper import to_prediction
 from src.modules.patients.domain.repositories.medical_record_repository import MedicalRecordRepository
-from src.modules.models.internal import inference_engine
 from src.shared.exceptions import NotFoundException, BadRequestException
 from src.shared.responses import ErrorDetail
 
@@ -16,9 +17,11 @@ class PredictionService:
         self,
         prediction_repo: PredictionRepository,
         medical_record_repo: MedicalRecordRepository,
+        engine: InferenceEngine,
     ):
         self.prediction_repo = prediction_repo
         self.record_repo = medical_record_repo
+        self.engine = engine
 
     async def create_prediction(
         self,
@@ -27,9 +30,8 @@ class PredictionService:
         doctor_id: UUID,
     ) -> Prediction:
         """
-        Fetch medical record, run inference + explanation, store result.
-
-        Always generates both prediction and LLM explanation.
+        Fetch medical record, run inference + explanation via the shared
+        InferenceEngine, persist the structured result.
         """
         record = await self.record_repo.get_by_id(medical_record_id)
         if not record:
@@ -50,49 +52,15 @@ class PredictionService:
                 ),
             )
 
-        # Map to context and run full inference + explanation
-        context = to_context(record)
-        payload = inference_engine.predict_with_explanation(context)
+        patient = to_context(record)
+        result = await self.engine.apredict(patient, explain="require")
 
-        decision = payload["decision"]
-        safety = payload["safety"]
-        explanation = payload["explanation"]
-
-        prediction = Prediction(
+        prediction = to_prediction(
+            result,
             medical_record_id=medical_record_id,
             patient_id=patient_id,
-            created_by=doctor_id,
-            # Model recommendation
-            recommended_treatment=decision["recommended_treatment"],
-            recommended_idx=decision["recommended_idx"],
-            confidence_pct=decision["confidence_pct"],
-            confidence_label=decision["confidence_label"],
-            mean_gap=decision["mean_gap"],
-            runner_up=decision["runner_up"],
-            runner_up_win_rate=decision["runner_up_win_rate"],
-            win_rates=decision["win_rates"],
-            posterior_means=decision["posterior_means"],
-            # Safety
-            safety_status=safety["status"],
-            safety_details={
-                "recommended_contraindications": safety["recommended_contraindications"],
-                "recommended_warnings": safety["recommended_warnings"],
-                "excluded_treatments": safety["excluded_treatments"],
-                "all_warnings": safety["all_warnings"],
-            },
-            # Fairness
-            fairness=payload["fairness"],
-            # Explanation
-            explanation_summary=explanation["recommendation_summary"],
-            explanation_runner_up=explanation["runner_up_analysis"],
-            explanation_confidence=explanation["confidence_statement"],
-            explanation_safety=explanation["safety_assessment"],
-            explanation_monitoring=explanation["monitoring_note"],
-            explanation_disclaimer=explanation["disclaimer"],
-            # Doctor decision
-            doctor_decision=DoctorDecision.PENDING,
+            doctor_id=doctor_id,
         )
-
         return await self.prediction_repo.create(prediction)
 
     async def record_doctor_decision(
