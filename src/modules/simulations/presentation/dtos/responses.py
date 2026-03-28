@@ -4,6 +4,7 @@ from uuid import UUID
 
 from pydantic import BaseModel, Field
 
+from src.shared.inference import LearningStepEvent
 from src.modules.simulations.domain.models.simulation import Simulation
 from src.modules.simulations.domain.models.simulation_step import SimulationStep
 
@@ -122,21 +123,30 @@ class SSEStepResponse(BaseModel):
         populate_by_name = True
 
     @staticmethod
-    def from_runner(data: Dict) -> "SSEStepResponse":
-        """Build from the simulation runner's computed values."""
+    def from_event(event: LearningStepEvent, extras: Dict) -> "SSEStepResponse":
+        """
+        Build from a ``LearningStepEvent`` plus runner-local extras.
+
+        ``extras`` must supply the fields the event does not carry:
+        ``total_steps``, ``selected_treatment``, ``epsilon``,
+        ``running_estimates``, ``treatment_counts``.
+        Cumulative reward/regret and running accuracy are read directly
+        from the event so the wire shape stays byte-identical to
+        ``from_entity``.
+        """
         return SSEStepResponse(
-            step=data["step"],
-            totalSteps=data["total_steps"],
-            selectedIdx=data["selected_idx"],
-            selectedTreatment=data["selected_treatment"],
-            explored=data["explored"],
-            observedReward=data["observed_reward"],
-            epsilon=data["epsilon"],
-            runningEstimates=data["running_estimates"],
-            runningAccuracy=data["running_accuracy"],
-            cumulativeReward=data["cumulative_reward"],
-            cumulativeRegret=data["cumulative_regret"],
-            treatmentCounts=data["treatment_counts"],
+            step=event.step,
+            totalSteps=extras["total_steps"],
+            selectedIdx=event.selectedIdx,
+            selectedTreatment=extras["selected_treatment"],
+            explored=event.explored,
+            observedReward=round(float(event.observedReward), 4),
+            epsilon=extras["epsilon"],
+            runningEstimates=extras["running_estimates"],
+            runningAccuracy=round(float(event.runningAccuracy), 4),
+            cumulativeReward=round(float(event.cumulativeReward), 4),
+            cumulativeRegret=round(float(event.cumulativeRegret), 4),
+            treatmentCounts=extras["treatment_counts"],
         )
 
     @staticmethod

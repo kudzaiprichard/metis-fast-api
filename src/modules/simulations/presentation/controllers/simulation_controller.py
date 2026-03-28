@@ -25,6 +25,8 @@ from src.modules.simulations.internal.simulation_runner import (
     run_simulation,
     parse_and_validate_csv,
     simulation_registry,
+    MAX_CSV_SIZE_BYTES,
+    MAX_PATIENTS,
 )
 
 logger = logging.getLogger(__name__)
@@ -57,6 +59,15 @@ async def start_simulation(
 
     try:
         content = await file.read()
+        if len(content) > MAX_CSV_SIZE_BYTES:
+            max_mb = MAX_CSV_SIZE_BYTES // (1024 * 1024)
+            raise BadRequestException(
+                message=f"CSV file exceeds maximum size of {max_mb} MB",
+                error_detail=ErrorDetail(
+                    title="File Too Large", code="FILE_TOO_LARGE", status=400,
+                    details=[f"Maximum file size is {max_mb} MB. Uploaded file is {len(content) / (1024 * 1024):.1f} MB."],
+                ),
+            )
         csv_content = content.decode("utf-8")
     except UnicodeDecodeError:
         raise BadRequestException(
@@ -186,12 +197,25 @@ async def stream_simulation(
                 skip += len(chunk)
 
             sim = await service.get_simulation(sim_id)
-            yield {"event": "complete", "data": json.dumps({"status": sim.status.value})}
+            complete_data = {"status": sim.status.value}
+            if sim.status == SimulationStatus.COMPLETED and sim.final_accuracy is not None:
+                complete_data.update({
+                    "final_accuracy": sim.final_accuracy,
+                    "final_cumulative_reward": sim.final_cumulative_reward,
+                    "final_cumulative_regret": sim.final_cumulative_regret,
+                    "mean_reward": sim.mean_reward,
+                    "mean_regret": sim.mean_regret,
+                    "thompson_exploration_rate": sim.thompson_exploration_rate,
+                    "treatment_counts": sim.treatment_counts,
+                    "confidence_distribution": sim.confidence_distribution,
+                    "safety_distribution": sim.safety_distribution,
+                })
+            yield {"event": "complete", "data": json.dumps(complete_data)}
 
     return EventSourceResponse(event_generator())
 
 
-@router.post("/{simulation_id}/cancel")
+@router.post("/{simulation_id}/cancel", status_code=202)
 async def cancel_simulation(
     simulation_id: str,
     service: SimulationService = Depends(get_simulation_service),
@@ -217,10 +241,9 @@ async def cancel_simulation(
     if not cancelled:
         await service.mark_cancelled(sim_id)
 
-    simulation = await service.get_simulation(sim_id)
     return ApiResponse.ok(
-        value=SimulationResponse.from_entity(simulation),
-        message="Simulation cancellation requested",
+        value=None,
+        message="Simulation cancellation requested. Status will transition to CANCELLED asynchronously — poll GET /simulations/{id} or watch the SSE stream.",
     )
 
 
@@ -252,15 +275,18 @@ async def get_simulation(
 @router.get("/{simulation_id}/steps")
 async def get_simulation_steps(
     simulation_id: str,
-    skip: int = Query(default=0, ge=0),
-    limit: int = Query(default=100, ge=1, le=1000),
+    pagination: PaginationParams = Depends(get_pagination),
     service: SimulationService = Depends(get_simulation_service),
     current_user: User = Depends(get_current_user),
 ):
     from uuid import UUID as UUIDType
-    steps = await service.get_simulation_steps(UUIDType(simulation_id), skip=skip, limit=limit)
-    return ApiResponse.ok(
+    sim_id = UUIDType(simulation_id)
+    steps, total = await service.get_simulation_steps_paginated(
+        sim_id, page=pagination.page, page_size=pagination.page_size,
+    )
+    return PaginatedResponse.ok(
         value=[SimulationStepResponse.from_entity(s) for s in steps],
+        page=pagination.page, total=total, page_size=pagination.page_size,
         message=f"Retrieved {len(steps)} steps",
     )
 
