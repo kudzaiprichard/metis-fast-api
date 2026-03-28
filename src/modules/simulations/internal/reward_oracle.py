@@ -1,14 +1,18 @@
 """
 Reward oracle for simulation module.
 Copied from ML project data_generator.py — only reward_oracle.
-Import paths updated to use models module constants.
 Implementation unchanged to preserve identical behaviour with notebook.
+
+TREATMENTS is hardcoded locally (not imported from shared/inference or the
+now-removed legacy models.internal.constants). The oracle is a
+simulation-owned artefact; shared/inference deliberately accepts oracle
+reward vectors as an input, so the simulation owns the arm ordering too.
 """
 
 import numpy as np
 from typing import Dict
 
-from src.modules.models.internal.constants import TREATMENTS
+TREATMENTS = ("Metformin", "GLP-1", "SGLT-2", "DPP-4", "Insulin")
 
 # Treatment-specific noise std devs
 TREATMENT_NOISE = {
@@ -20,7 +24,7 @@ TREATMENT_NOISE = {
 }
 
 
-def reward_oracle(context: Dict, treatment: str, noise: bool = True) -> float:
+def reward_oracle(context: Dict, treatment: str, noise: bool = True, rng: np.random.RandomState = None) -> float:
     age = context["age"]
     bmi = context["bmi"]
     hba1c = context["hba1c_baseline"]
@@ -172,6 +176,7 @@ def reward_oracle(context: Dict, treatment: str, noise: bool = True) -> float:
 
     if noise:
         sigma = TREATMENT_NOISE[treatment]
-        reward += np.random.normal(0, sigma)
+        _rng = rng if rng is not None else np.random
+        reward += _rng.normal(0, sigma)
 
     return float(np.clip(reward, 0.0, 10.0))

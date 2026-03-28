@@ -1,3 +1,4 @@
+import asyncio
 import logging
 from typing import Sequence, Tuple
 from uuid import UUID
@@ -13,6 +14,11 @@ from src.shared.responses import ErrorDetail
 logger = logging.getLogger(__name__)
 
 MAX_CONCURRENT_SIMULATIONS = 3
+
+# Process-level lock to prevent TOCTOU race on the concurrency check.
+# Sufficient for single-worker deployments; for multi-worker, use a
+# database advisory lock instead.
+_create_simulation_lock = asyncio.Lock()
 
 
 class SimulationService:
@@ -36,36 +42,37 @@ class SimulationService:
         random_seed: int = 42,
         reset_posterior: bool = True,
     ) -> Simulation:
-        running_count = await self.simulation_repo.count_running()
-        if running_count >= MAX_CONCURRENT_SIMULATIONS:
-            raise ConflictException(
-                message=f"Maximum of {MAX_CONCURRENT_SIMULATIONS} concurrent simulations reached",
-                error_detail=ErrorDetail(
-                    title="Concurrency Limit",
-                    code="MAX_SIMULATIONS_REACHED",
-                    status=409,
-                    details=[f"{running_count} simulations are currently running"],
-                ),
+        async with _create_simulation_lock:
+            running_count = await self.simulation_repo.count_running()
+            if running_count >= MAX_CONCURRENT_SIMULATIONS:
+                raise ConflictException(
+                    message=f"Maximum of {MAX_CONCURRENT_SIMULATIONS} concurrent simulations reached",
+                    error_detail=ErrorDetail(
+                        title="Concurrency Limit",
+                        code="MAX_SIMULATIONS_REACHED",
+                        status=409,
+                        details=[f"{running_count} simulations are currently running"],
+                    ),
+                )
+
+            simulation = Simulation(
+                initial_epsilon=initial_epsilon,
+                epsilon_decay=epsilon_decay,
+                min_epsilon=min_epsilon,
+                random_seed=random_seed,
+                reset_posterior=reset_posterior,
+                dataset_filename=dataset_filename,
+                dataset_row_count=dataset_row_count,
+                status=SimulationStatus.PENDING,
+                current_step=0,
             )
 
-        simulation = Simulation(
-            initial_epsilon=initial_epsilon,
-            epsilon_decay=epsilon_decay,
-            min_epsilon=min_epsilon,
-            random_seed=random_seed,
-            reset_posterior=reset_posterior,
-            dataset_filename=dataset_filename,
-            dataset_row_count=dataset_row_count,
-            status=SimulationStatus.PENDING,
-            current_step=0,
-        )
-
-        simulation = await self.simulation_repo.create(simulation)
-        logger.info(
-            "Simulation created: %s (file=%s, rows=%d)",
-            simulation.id, dataset_filename, dataset_row_count,
-        )
-        return simulation
+            simulation = await self.simulation_repo.create(simulation)
+            logger.info(
+                "Simulation created: %s (file=%s, rows=%d)",
+                simulation.id, dataset_filename, dataset_row_count,
+            )
+            return simulation
 
     # ── Read ──
 
@@ -103,6 +110,18 @@ class SimulationService:
     ) -> Sequence[SimulationStep]:
         await self.get_simulation(simulation_id)
         return await self.step_repo.get_by_simulation(simulation_id, skip, limit)
+
+    async def get_simulation_steps_paginated(
+        self,
+        simulation_id: UUID,
+        page: int = 1,
+        page_size: int = 20,
+    ) -> Tuple[Sequence[SimulationStep], int]:
+        await self.get_simulation(simulation_id)
+        total = await self.step_repo.count_by_simulation(simulation_id)
+        skip = (page - 1) * page_size
+        steps = await self.step_repo.get_by_simulation(simulation_id, skip, page_size)
+        return steps, total
 
     async def get_steps_from(
         self,
