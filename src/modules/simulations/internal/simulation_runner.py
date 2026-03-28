@@ -1,17 +1,53 @@
 """
-Simulation Runner — runs simulation directly in the API process.
+Simulation Runner — runs a bandit simulation directly in the API process.
 
-No arq worker, no Redis Streams. The simulation runs as a background
-asyncio task, streams results via an in-memory asyncio.Queue, and
-batch-persists steps to the database.
+Phase 4 cutover: the runner no longer reaches into ``NeuralThompson`` /
+``FeaturePipeline`` / safety checkers. It drives a per-simulation
+``InferenceEngine.alearning_stream`` and projects the emitted
+``LearningStepEvent`` + a small amount of runner-local state into the
+existing ``SimulationStep`` row shape and ``SSEStepResponse`` SSE frames.
 
-Architecture:
-    POST /simulations → creates simulation + launches background task
-    GET  /simulations/{id}/stream → subscribes to the queue via SSE
-    POST /simulations/{id}/cancel → cancels a running simulation
-    Background task → computes steps, pushes to queue, persists to DB
+Phase-4 open-decision resolutions (§5 of the audit)
+---------------------------------------------------
+ε-greedy handling — DROP.
+    ``LearningStream`` owns action selection atomically (Thompson-draw →
+    argmax → observe → online-update). There is no public hook for
+    injecting a pre-chosen action into a step. "Wrap externally" (option
+    (a) in the audit) would require a second posterior update per step
+    with a random arm, polluting the Bayesian linear regression and
+    invalidating regret analysis. Thompson sampling already explores —
+    the event exposes this via ``explored = selected_idx !=
+    posterior_mean_argmax``, which we persist as ``thompson_explored``.
+    We still compute and log the decayed ε value each step (so the
+    frontend's epsilon-decay chart keeps working); ``epsilon_explored``
+    is always False. If product wants ε-greedy back, it has to land in
+    ``shared/inference`` as a first-class API.
 
-NOTE: The simulation registry is process-local. It will not survive
+Per-simulation posterior reset — build via ``from_config`` + optional
+``model.reset_posterior()``.
+    ``InferenceEngine.from_config`` loads the saved ``.pt`` checkpoint,
+    which includes the trained posterior (A, A_inv, b, mu). To honour
+    ``reset_posterior=True`` per simulation, we call
+    ``sim_engine.model.reset_posterior()`` after construction — this
+    reverts the posterior to the prior while keeping the trained network
+    backbone intact. ``InferenceConfig`` exposes no ``reset_posterior``
+    flag, so a post-construction call is the only route that doesn't
+    require editing the frozen shared library. Each simulation gets its
+    own engine, so the in-place reset does not touch the app-wide engine
+    on ``app.state.engine``.
+
+Oracle noise
+------------
+The legacy runner called ``reward_oracle(..., noise=True)`` to obtain
+``observed_reward`` and ``noise=False`` for regret accounting. The new
+``LearningStream.astep`` takes a single oracle vector and derives both
+observed reward and regret from it internally — so we pass the
+noise-free vector. Consequence: ``observed_reward`` and
+``instantaneous_regret`` are now both noise-free in persisted rows and
+SSE frames. This is a deliberate behaviour change and cleaner for
+regret analysis.
+
+NOTE: the simulation registry is process-local. It will not survive
 process restarts or scale across multiple workers. If horizontal scaling
 is needed, replace with Redis pub/sub or similar distributed mechanism.
 """
@@ -24,21 +60,18 @@ import asyncio
 import time
 import warnings
 import numpy as np
-from typing import Dict, List, AsyncIterator
+from typing import Dict, List
 from uuid import UUID
 from collections import Counter
 
 # Suppress sklearn feature name warnings from transform_single
 warnings.filterwarnings("ignore", message="X does not have valid feature names")
 
-from src.modules.models.internal.constants import (
-    TREATMENTS, N_TREATMENTS, IDX_TO_TREATMENT, CONTEXT_FEATURES,
-)
-from src.modules.models.internal.model_loader import registry
-from src.modules.models.internal.explainability import (
-    run_safety_checks, get_safety_for_recommended,
-)
-from src.modules.simulations.internal.reward_oracle import reward_oracle
+from pydantic import ValidationError as PydanticValidationError
+
+from src.shared.inference import InferenceEngine, LearningStepEvent, PatientInput
+from src.shared.inference_bootstrap import build_inference_config
+from src.modules.simulations.internal.reward_oracle import reward_oracle, TREATMENTS
 from src.modules.simulations.domain.models.simulation_step import SimulationStep
 from src.modules.simulations.domain.models.enums import SimulationStatus
 from src.modules.simulations.presentation.dtos.responses import SSEStepResponse
@@ -48,26 +81,33 @@ from src.modules.simulations.domain.repositories.simulation_step_repository impo
 
 logger = logging.getLogger(__name__)
 
+# Treatment-index helpers derived locally (do not reach into shared/inference
+# internals). Ordering matches the engine's arm indexing contract.
+N_TREATMENTS = len(TREATMENTS)
+IDX_TO_TREATMENT = dict(enumerate(TREATMENTS))
+
+# The 16 clinical features the simulation CSV must carry. Matches
+# ``PatientInput.feature_dict()`` keys by contract; kept local so the
+# simulation's CSV schema is not coupled to the engine's private constants.
+CONTEXT_FEATURES = [
+    "age", "bmi", "hba1c_baseline", "egfr", "diabetes_duration",
+    "fasting_glucose", "c_peptide", "cvd", "ckd", "nafld", "hypertension",
+    "bp_systolic", "ldl", "hdl", "triglycerides", "alt",
+]
+
 MIN_PATIENTS = 100
+MAX_PATIENTS = 50_000
+MAX_CSV_SIZE_BYTES = 20 * 1024 * 1024  # 20 MB
 DB_BATCH_SIZE = 100
 PROGRESS_UPDATE_INTERVAL = 100
 MAX_DB_FLUSH_FAILURES = 3
+MAX_DB_FLUSH_RETRIES = 3  # retries for the final flush
+MAX_SUBSCRIBERS = 20
+MAX_HISTORY_SIZE = 5_000  # cap in-memory history; beyond this, rely on DB replay
 
 # Registry TTL: entries older than this are swept even if not cleaned up.
 # Guards against leaked entries from crashed tasks.
 REGISTRY_TTL_SECONDS = 3600  # 1 hour
-
-FEATURE_RANGES = {
-    "age": (18, 120), "bmi": (10.0, 80.0), "hba1c_baseline": (3.0, 20.0),
-    "egfr": (5.0, 200.0), "diabetes_duration": (0.0, 60.0),
-    "fasting_glucose": (50.0, 500.0), "c_peptide": (0.0, 10.0),
-    "cvd": (0, 1), "ckd": (0, 1), "nafld": (0, 1), "hypertension": (0, 1),
-    "bp_systolic": (60.0, 250.0), "ldl": (20.0, 400.0), "hdl": (10.0, 150.0),
-    "triglycerides": (30.0, 800.0), "alt": (5.0, 500.0),
-}
-BINARY_FEATURES = {"cvd", "ckd", "nafld", "hypertension"}
-INT_FEATURES = {"age"}
-
 
 # ─────────────────────────────────────────────────────────────
 # In-memory simulation registry — tracks running simulations
@@ -129,13 +169,23 @@ class SimulationRegistry:
         return True
 
     def subscribe(self, simulation_id: UUID) -> asyncio.Queue | None:
+        """
+        Atomically check registration and subscribe.
+        Returns None if the simulation is not registered (caller should
+        fall back to DB replay). Returns a Queue otherwise.
+        """
         sim = self._simulations.get(simulation_id)
         if not sim:
+            return None
+        if len(sim["subscribers"]) >= MAX_SUBSCRIBERS:
             return None
         q: asyncio.Queue = asyncio.Queue(maxsize=1000)
         # Replay history for late-joining clients
         for event in sim["history"]:
-            q.put_nowait(event)
+            try:
+                q.put_nowait(event)
+            except asyncio.QueueFull:
+                break
         sim["subscribers"].append(q)
         return q
 
@@ -148,12 +198,23 @@ class SimulationRegistry:
         sim = self._simulations.get(simulation_id)
         if not sim:
             return
-        sim["history"].append(event)
+        # Cap in-memory history to prevent unbounded growth.
+        # Late-joining clients beyond this point fall back to DB replay.
+        if len(sim["history"]) < MAX_HISTORY_SIZE:
+            sim["history"].append(event)
         dead_queues = []
         for q in sim["subscribers"]:
             try:
                 q.put_nowait(event)
             except asyncio.QueueFull:
+                # Send a sentinel error event before dropping the subscriber
+                try:
+                    q.put_nowait({
+                        "type": "error",
+                        "data": {"error": "Subscriber queue full — connection dropped"},
+                    })
+                except asyncio.QueueFull:
+                    pass
                 dead_queues.append(q)
         for q in dead_queues:
             sim["subscribers"].remove(q)
@@ -193,6 +254,12 @@ simulation_registry = SimulationRegistry()
 # ─────────────────────────────────────────────────────────────
 
 def parse_and_validate_csv(csv_content: str) -> List[Dict]:
+    # PatientInput (shared/inference) owns per-field validation. We only
+    # handle CSV-shape concerns here (headers, row count, file size) and
+    # per-row numeric coercion, then defer to PatientInput for ranges /
+    # binary literals / type coercion. This guarantees any row that passes
+    # upload validation will also pass the engine's per-step _validate_patient
+    # inside LearningStream.astep — no silent divergence, no mid-run failures.
     reader = csv.DictReader(io.StringIO(csv_content))
     if reader.fieldnames is None:
         raise ValueError("CSV file is empty or has no headers")
@@ -203,31 +270,33 @@ def parse_and_validate_csv(csv_content: str) -> List[Dict]:
     patients, errors = [], []
     for row_idx, raw_row in enumerate(reader, start=2):
         row = {k.strip(): v.strip() if v else v for k, v in raw_row.items()}
-        patient = {}
+        row_values: Dict[str, object] = {}
+        row_failed = False
         for feat in CONTEXT_FEATURES:
             val = row.get(feat)
             if val is None or val == "":
                 errors.append(f"Row {row_idx}: missing value for '{feat}'")
+                row_failed = True
                 continue
             try:
-                if feat in BINARY_FEATURES:
-                    parsed = int(float(val))
-                    if parsed not in (0, 1):
-                        errors.append(f"Row {row_idx}: '{feat}' must be 0 or 1, got {parsed}")
-                        continue
-                elif feat in INT_FEATURES:
-                    parsed = int(float(val))
-                else:
-                    parsed = float(val)
-                lo, hi = FEATURE_RANGES[feat]
-                if not (lo <= parsed <= hi):
-                    errors.append(f"Row {row_idx}: '{feat}' value {parsed} out of range [{lo}, {hi}]")
-                    continue
-                patient[feat] = parsed
+                parsed = float(val)
             except (ValueError, TypeError):
                 errors.append(f"Row {row_idx}: '{feat}' has invalid value '{val}'")
-        if len(patient) == len(CONTEXT_FEATURES):
-            patients.append(patient)
+                row_failed = True
+                continue
+            row_values[feat] = int(parsed) if parsed.is_integer() else parsed
+        if row_failed:
+            continue
+        try:
+            pi = PatientInput.model_validate(row_values)
+        except PydanticValidationError as e:
+            for err in e.errors():
+                field = ".".join(str(p) for p in err.get("loc", ())) or "_"
+                errors.append(
+                    f"Row {row_idx}: '{field}' {err.get('msg', 'invalid value')}"
+                )
+            continue
+        patients.append(pi.feature_dict())
     if errors:
         raise ValueError(
             f"CSV validation failed with {len(errors)} error(s):\n"
@@ -236,52 +305,90 @@ def parse_and_validate_csv(csv_content: str) -> List[Dict]:
         )
     if len(patients) < MIN_PATIENTS:
         raise ValueError(f"CSV must contain at least {MIN_PATIENTS} valid patient rows, found {len(patients)}")
+    if len(patients) > MAX_PATIENTS:
+        raise ValueError(
+            f"CSV exceeds maximum of {MAX_PATIENTS:,} patient rows (found {len(patients):,}). "
+            f"Reduce the dataset size and try again."
+        )
     return patients
 
 
 # ─────────────────────────────────────────────────────────────
-# DB persistence helper
+# Projection helpers — LearningStepEvent → DB row
 # ─────────────────────────────────────────────────────────────
 
-def _build_step_entity(simulation_id: UUID, payload: Dict, aggregates: Dict) -> SimulationStep:
+def _runner_up_from_win_rates(win_rates: Dict[str, float]) -> tuple[str, float]:
+    """Second-place arm by win rate (matches legacy confidence output)."""
+    ordered = sorted(win_rates.items(), key=lambda kv: kv[1], reverse=True)
+    if len(ordered) < 2:
+        return ordered[0] if ordered else ("", 0.0)
+    name, rate = ordered[1]
+    return name, float(rate)
+
+
+def _build_step_entity(
+    simulation_id: UUID,
+    event: LearningStepEvent,
+    patient: Dict,
+    epsilon: float,
+    oracle_rewards: Dict[str, float],
+    optimal_treatment: str,
+    optimal_reward: float,
+    selected_treatment: str,
+    posterior_mean_best: str,
+    runner_up_name: str,
+    runner_up_wr: float,
+    running_estimates: Dict[str, float],
+    treatment_counts: Dict[str, int],
+) -> SimulationStep:
     return SimulationStep(
         simulation_id=simulation_id,
-        step_number=payload["step"],
-        epsilon=payload["epsilon"],
-        patient_context=payload["patient"],
-        oracle_rewards=payload["oracle"]["rewards"],
-        optimal_treatment=payload["oracle"]["optimal_treatment"],
-        optimal_reward=payload["oracle"]["optimal_reward"],
-        selected_treatment=payload["decision"]["selected_treatment"],
-        selected_idx=payload["decision"]["selected_idx"],
-        posterior_means=payload["decision"]["posterior_means"],
-        win_rates=payload["decision"]["win_rates"],
-        confidence_pct=payload["decision"]["confidence_pct"],
-        confidence_label=payload["decision"]["confidence_label"],
-        sampled_values=payload["decision"]["sampled_values"],
-        runner_up=payload["decision"]["runner_up"],
-        runner_up_winrate=payload["decision"]["runner_up_winrate"],
-        mean_gap=payload["decision"]["mean_gap"],
-        thompson_explored=payload["exploration"]["thompson_explored"],
-        epsilon_explored=payload["exploration"]["epsilon_explored"],
-        posterior_mean_best=payload["exploration"]["posterior_mean_best"],
-        observed_reward=payload["outcome"]["observed_reward"],
-        instantaneous_regret=payload["outcome"]["instantaneous_regret"],
-        matched_oracle=payload["outcome"]["matched_oracle"],
-        safety_status=payload["safety"]["status"],
-        safety_contraindications=payload["safety"]["contraindications"],
-        safety_warnings=payload["safety"]["warnings"],
-        cumulative_reward=aggregates["cumulative_reward"],
-        cumulative_regret=aggregates["cumulative_regret"],
-        running_accuracy=aggregates["running_accuracy"],
-        treatment_counts=aggregates["treatment_counts"],
-        running_estimates=aggregates["running_estimates"],
+        step_number=event.step,
+        epsilon=epsilon,
+        patient_context={feat: patient[feat] for feat in CONTEXT_FEATURES},
+        oracle_rewards={t: round(r, 4) for t, r in oracle_rewards.items()},
+        optimal_treatment=optimal_treatment,
+        optimal_reward=round(float(optimal_reward), 4),
+        selected_treatment=selected_treatment,
+        selected_idx=event.selectedIdx,
+        posterior_means={k: float(v) for k, v in event.posteriorMeans.items()},
+        win_rates={k: float(v) for k, v in event.winRates.items()},
+        confidence_pct=int(event.confidencePct),
+        confidence_label=event.confidenceLabel,
+        sampled_values={
+            k: round(float(v), 4) for k, v in event.thompsonSamples.items()
+        },
+        runner_up=runner_up_name,
+        runner_up_winrate=runner_up_wr,
+        mean_gap=float(event.meanGap),
+        thompson_explored=bool(event.explored),
+        # ε-greedy dropped (see module docstring); persisted False for
+        # schema compatibility and so the UI can tell the two exploration
+        # channels apart historically.
+        epsilon_explored=False,
+        posterior_mean_best=posterior_mean_best,
+        observed_reward=round(float(event.observedReward), 4),
+        instantaneous_regret=round(float(event.regret), 4),
+        matched_oracle=bool(event.selectedIdx == event.oracleOptimalIdx),
+        safety_status=event.safetyStatus,
+        # shared/inference surfaces only the aggregate status per-step in
+        # the event; detailed contraindication/warning lists are not part
+        # of the LearningStepEvent schema. Stored empty for the frozen
+        # API contract; full safety detail remains available via
+        # ``engine.apredict(patient, explain=False)`` for drill-down.
+        safety_contraindications=[],
+        safety_warnings=[],
+        cumulative_reward=round(float(event.cumulativeReward), 4),
+        cumulative_regret=round(float(event.cumulativeRegret), 4),
+        running_accuracy=round(float(event.runningAccuracy), 4),
+        treatment_counts=treatment_counts,
+        running_estimates=running_estimates,
     )
 
 
 async def _flush_to_db(simulation_id: UUID, step_buffer: List[SimulationStep], step_number: int) -> None:
     """
-    Flush a batch of steps to the database.
+    Flush a batch of steps to the database and update progress atomically.
     Raises on failure so the caller can track it — no longer silently swallowed.
     """
     if not step_buffer:
@@ -290,76 +397,8 @@ async def _flush_to_db(simulation_id: UUID, step_buffer: List[SimulationStep], s
         async with session.begin():
             step_repo = SimulationStepRepository(session)
             await step_repo.create_batch(step_buffer)
-    if step_number % PROGRESS_UPDATE_INTERVAL == 0 or step_number > 0:
-        async with async_session() as session:
-            async with session.begin():
-                repo = SimulationRepository(session)
-                await repo.update_progress(simulation_id, step_number)
-
-
-# ─────────────────────────────────────────────────────────────
-# CPU-heavy step computation — runs in thread pool
-# ─────────────────────────────────────────────────────────────
-
-def _compute_step(patient, epsilon, model, pipeline, rng):
-    """
-    All CPU-heavy work for a single simulation step.
-    Runs in a thread via asyncio.to_thread so the event loop stays free.
-    Uses per-simulation rng instead of global np.random to avoid
-    cross-contamination between concurrent simulations.
-
-    IMPORTANT: This function mutates `model` via update_posterior().
-    This is safe because steps are executed sequentially (one await per step).
-    Do NOT parallelize step execution without adding a lock around model access.
-    """
-    x = pipeline.transform_single(patient)
-
-    oracle_rewards = {t: reward_oracle(patient, t, noise=False) for t in TREATMENTS}
-    oracle_rewards_list = [oracle_rewards[t] for t in TREATMENTS]
-    optimal_idx = int(np.argmax(oracle_rewards_list))
-    optimal_treatment = TREATMENTS[optimal_idx]
-    optimal_reward = oracle_rewards_list[optimal_idx]
-
-    selected_idx, sampled_values = model.select_action(x)
-    selected_treatment = IDX_TO_TREATMENT[selected_idx]
-
-    confidence = model.compute_confidence(x, n_draws=200)
-
-    posterior_mean_best = max(
-        confidence["posterior_means"], key=confidence["posterior_means"].get
-    )
-    explored = selected_treatment != posterior_mean_best
-    epsilon_explored = bool(rng.random() < epsilon)
-
-    observed_reward = reward_oracle(patient, selected_treatment, noise=True)
-    instantaneous_regret = optimal_reward - reward_oracle(
-        patient, selected_treatment, noise=False
-    )
-    matched_oracle = selected_idx == optimal_idx
-
-    safety_all = run_safety_checks(patient)
-    safety_for_selected = get_safety_for_recommended(safety_all, selected_treatment)
-
-    # Update posterior inside the thread — safe because steps run sequentially.
-    model.update_posterior(x, selected_idx, observed_reward)
-
-    return {
-        "oracle_rewards": oracle_rewards,
-        "optimal_idx": optimal_idx,
-        "optimal_treatment": optimal_treatment,
-        "optimal_reward": optimal_reward,
-        "selected_idx": selected_idx,
-        "selected_treatment": selected_treatment,
-        "sampled_values": sampled_values,
-        "confidence": confidence,
-        "posterior_mean_best": posterior_mean_best,
-        "explored": explored,
-        "epsilon_explored": epsilon_explored,
-        "observed_reward": observed_reward,
-        "instantaneous_regret": instantaneous_regret,
-        "matched_oracle": matched_oracle,
-        "safety_for_selected": safety_for_selected,
-    }
+            repo = SimulationRepository(session)
+            await repo.update_progress(simulation_id, step_number)
 
 
 # ─────────────────────────────────────────────────────────────
@@ -378,12 +417,15 @@ async def run_simulation(
     """
     Run the full bandit simulation in-process.
 
-    1. Mark simulation as RUNNING
-    2. Register in the simulation registry for SSE subscribers
-    3. For each patient: compute step in thread pool, publish to subscribers, buffer for DB
-    4. Batch-persist to DB every DB_BATCH_SIZE steps
-    5. On completion: save final aggregates, mark COMPLETED, cleanup registry
-    6. On cancellation: flush remaining steps, mark CANCELLED, cleanup registry
+    1. Build a per-simulation InferenceEngine (fresh posterior if requested)
+    2. Mark simulation as RUNNING
+    3. Register in the simulation registry for SSE subscribers
+    4. Drive engine.alearning_stream; for each patient compute the oracle
+       vector, call stream.astep, project the LearningStepEvent into a
+       SimulationStep row and an SSEStepResponse frame
+    5. Batch-persist to DB every DB_BATCH_SIZE steps
+    6. On completion: save final aggregates, mark COMPLETED, cleanup registry
+    7. On cancellation: flush remaining steps, mark CANCELLED, cleanup registry
     """
     logger.info("Simulation %s starting (n=%d)", simulation_id, len(patients))
 
@@ -395,6 +437,17 @@ async def run_simulation(
     # Register for SSE subscribers
     simulation_registry.register(simulation_id)
 
+    # Per-simulation RNG — feeds the LearningStream's Thompson draws so
+    # concurrent simulations do not share the default generator.
+    rng = np.random.default_rng(random_seed)
+
+    # Per-simulation engine — isolates the sim's posterior from the
+    # app-wide engine on ``app.state.engine``. Honour reset_posterior
+    # via a post-construction call (see module docstring).
+    sim_engine = InferenceEngine.from_config(build_inference_config())
+    if reset_posterior:
+        sim_engine.model.reset_posterior()
+
     try:
         # Mark as running
         async with async_session() as session:
@@ -402,228 +455,207 @@ async def run_simulation(
                 repo = SimulationRepository(session)
                 await repo.update_status(simulation_id, SimulationStatus.RUNNING)
 
-        # Load fresh model instance
-        bundle = registry.get("default")
-        model = registry.clone_fresh("default", reset_posterior=reset_posterior)
-        pipeline = bundle.pipeline
-
-        # Per-simulation RNG — avoids cross-contamination between
-        # concurrent simulations sharing the default thread pool
-        rng = np.random.RandomState(random_seed)
-
         n_patients = len(patients)
-        cumulative_reward = 0.0
-        cumulative_regret = 0.0
-        correct_count = 0
-        thompson_explore_count = 0
-        treatment_counts = {t: 0 for t in TREATMENTS}
-        treatment_rewards = {t: 0.0 for t in TREATMENTS}
-        confidence_labels = []
-        safety_statuses = []
+        confidence_labels: List[str] = []
+        safety_statuses: List[str] = []
         step_buffer: List[SimulationStep] = []
         db_flush_failures = 0
+        thompson_explore_count = 0
 
-        for i in range(n_patients):
-            # ── Check for cancellation ──
-            if simulation_registry.is_cancelled(simulation_id):
-                logger.info("Simulation %s cancelled at step %d/%d", simulation_id, i + 1, n_patients)
+        # Aggregates tracked for the final frame + progress logging. The
+        # stream also emits running aggregates in the event, but some
+        # end-of-run metrics (thompson exploration rate, confidence /
+        # safety distributions) are not in the event schema, so we keep
+        # our own counters here.
+        final_event: LearningStepEvent | None = None
 
-                # Flush any buffered steps before marking cancelled
-                if step_buffer:
-                    try:
-                        await _flush_to_db(simulation_id, step_buffer, i)
-                        step_buffer.clear()
-                    except Exception as e:
-                        logger.error("Failed to flush steps on cancel: %s", e)
+        async with sim_engine.alearning_stream(
+            total_steps=n_patients, rng=rng,
+        ) as stream:
+            for i in range(n_patients):
+                # ── Check for cancellation ──
+                if simulation_registry.is_cancelled(simulation_id):
+                    logger.info(
+                        "Simulation %s cancelled at step %d/%d",
+                        simulation_id, i + 1, n_patients,
+                    )
 
-                # Mark cancelled in DB
-                async with async_session() as session:
-                    async with session.begin():
-                        repo = SimulationRepository(session)
-                        await repo.update_status(simulation_id, SimulationStatus.CANCELLED)
+                    if step_buffer:
+                        try:
+                            await _flush_to_db(simulation_id, step_buffer, i)
+                            step_buffer.clear()
+                        except Exception as e:
+                            logger.error("Failed to flush steps on cancel: %s", e)
 
-                # Notify subscribers
-                await simulation_registry.publish(simulation_id, {
-                    "type": "complete",
-                    "data": {"status": "CANCELLED", "cancelled_at_step": i},
-                })
-                simulation_registry.mark_completed(simulation_id)
-                simulation_registry.cleanup(simulation_id)
-                return
+                    async with async_session() as session:
+                        async with session.begin():
+                            repo = SimulationRepository(session)
+                            await repo.update_status(
+                                simulation_id, SimulationStatus.CANCELLED,
+                            )
 
-            patient = patients[i]
-            epsilon = max(min_epsilon, initial_epsilon * (epsilon_decay ** (i + 1)))
+                    await simulation_registry.publish(simulation_id, {
+                        "type": "complete",
+                        "data": {"status": "CANCELLED", "cancelled_at_step": i},
+                    })
+                    simulation_registry.mark_completed(simulation_id)
+                    simulation_registry.cleanup(simulation_id)
+                    return
 
-            # ── Compute step in thread pool (non-blocking) ──
-            result = await asyncio.to_thread(
-                _compute_step, patient, epsilon, model, pipeline, rng
-            )
-
-            # ── Unpack results ──
-            oracle_rewards = result["oracle_rewards"]
-            optimal_treatment = result["optimal_treatment"]
-            optimal_reward = result["optimal_reward"]
-            selected_idx = result["selected_idx"]
-            selected_treatment = result["selected_treatment"]
-            sampled_values = result["sampled_values"]
-            confidence = result["confidence"]
-            posterior_mean_best = result["posterior_mean_best"]
-            explored = result["explored"]
-            epsilon_explored = result["epsilon_explored"]
-            observed_reward = result["observed_reward"]
-            instantaneous_regret = result["instantaneous_regret"]
-            matched_oracle = result["matched_oracle"]
-            safety_for_selected = result["safety_for_selected"]
-
-            # ── Update aggregates ──
-            cumulative_reward += observed_reward
-            cumulative_regret += instantaneous_regret
-            treatment_counts[selected_treatment] += 1
-            treatment_rewards[selected_treatment] += observed_reward
-            if matched_oracle:
-                correct_count += 1
-            if explored:
-                thompson_explore_count += 1
-
-            running_accuracy = correct_count / (i + 1)
-            confidence_labels.append(confidence["confidence_label"])
-            safety_statuses.append(safety_for_selected["status"])
-
-            running_estimates = {
-                t: round(treatment_rewards[t] / max(treatment_counts[t], 1), 4)
-                for t in TREATMENTS
-            }
-
-            # ── Build full payload for DB persistence ──
-            payload = {
-                "step": i + 1,
-                "total_steps": n_patients,
-                "epsilon": round(epsilon, 6),
-                "patient": {feat: patient[feat] for feat in CONTEXT_FEATURES},
-                "oracle": {
-                    "rewards": {t: round(r, 4) for t, r in oracle_rewards.items()},
-                    "optimal_treatment": optimal_treatment,
-                    "optimal_idx": result["optimal_idx"],
-                    "optimal_reward": round(optimal_reward, 4),
-                },
-                "decision": {
-                    "selected_treatment": selected_treatment,
-                    "selected_idx": selected_idx,
-                    "sampled_values": {
-                        IDX_TO_TREATMENT[j]: round(float(sampled_values[j]), 4)
-                        for j in range(N_TREATMENTS)
-                    },
-                    "posterior_means": confidence["posterior_means"],
-                    "win_rates": confidence["win_rates"],
-                    "confidence_pct": confidence["confidence_pct"],
-                    "confidence_label": confidence["confidence_label"],
-                    "runner_up": confidence["runner_up"],
-                    "runner_up_winrate": confidence["runner_up_win_rate"],
-                    "mean_gap": confidence["mean_gap"],
-                },
-                "exploration": {
-                    "thompson_explored": explored,
-                    "epsilon_explored": epsilon_explored,
-                    "posterior_mean_best": posterior_mean_best,
-                },
-                "outcome": {
-                    "observed_reward": round(observed_reward, 4),
-                    "instantaneous_regret": round(instantaneous_regret, 4),
-                    "matched_oracle": matched_oracle,
-                },
-                "safety": {
-                    "status": safety_for_selected["status"],
-                    "contraindications": safety_for_selected["recommended_contraindications"],
-                    "warnings": safety_for_selected["recommended_warnings"],
-                    "excluded_treatments": {
-                        t: reasons for t, reasons
-                        in safety_for_selected["excluded_treatments"].items()
-                    },
-                },
-                "aggregates": {
-                    "cumulative_reward": round(cumulative_reward, 4),
-                    "cumulative_regret": round(cumulative_regret, 4),
-                    "running_accuracy": round(running_accuracy, 4),
-                    "treatment_counts": dict(treatment_counts),
-                    "running_estimates": running_estimates,
-                },
-            }
-
-            # ── Log progress ──
-            if (i + 1) % 10 == 0 or (i + 1) <= 5:
-                logger.info(
-                    "Step %d/%d | %s -> %s (oracle: %s) | reward=%.2f | regret=%.2f | acc=%.2f%% | confidence=%s",
-                    i + 1, n_patients,
-                    selected_treatment,
-                    "Y" if matched_oracle else "N",
-                    optimal_treatment,
-                    observed_reward,
-                    instantaneous_regret,
-                    running_accuracy * 100,
-                    confidence["confidence_label"],
+                patient = patients[i]
+                epsilon = max(
+                    min_epsilon, initial_epsilon * (epsilon_decay ** (i + 1))
                 )
 
-            # ── Publish lean SSE payload via DTO ──
-            sse_step = SSEStepResponse.from_runner({
-                "step": i + 1,
-                "total_steps": n_patients,
-                "selected_idx": selected_idx,
-                "selected_treatment": selected_treatment,
-                "explored": explored,
-                "observed_reward": round(observed_reward, 4),
-                "epsilon": round(epsilon, 6),
-                "running_estimates": running_estimates,
-                "running_accuracy": round(running_accuracy, 4),
-                "cumulative_reward": round(cumulative_reward, 4),
-                "cumulative_regret": round(cumulative_regret, 4),
-                "treatment_counts": dict(treatment_counts),
-            })
+                # Oracle vector — noise-free; see module docstring for
+                # the rationale behind dropping observation noise.
+                oracle_rewards = {
+                    t: reward_oracle(patient, t, noise=False) for t in TREATMENTS
+                }
+                oracle_vector = np.array(
+                    [oracle_rewards[t] for t in TREATMENTS], dtype=float,
+                )
+                optimal_idx = int(np.argmax(oracle_vector))
+                optimal_treatment = TREATMENTS[optimal_idx]
+                optimal_reward = float(oracle_vector[optimal_idx])
 
-            await simulation_registry.publish(simulation_id, {
-                "type": "step",
-                "data": sse_step.model_dump_json(by_alias=True),
-            })
+                # ── Drive the engine for one step ──
+                event: LearningStepEvent = await stream.astep(patient, oracle_vector)
+                final_event = event
 
-            # ── Buffer for DB (full payload) ──
-            step_entity = _build_step_entity(simulation_id, payload, payload["aggregates"])
-            step_buffer.append(step_entity)
+                # ── Derive runner-local projection fields ──
+                selected_treatment = IDX_TO_TREATMENT[event.selectedIdx]
+                posterior_mean_best = IDX_TO_TREATMENT[event.bestTreatmentIdx]
+                runner_up_name, runner_up_wr = _runner_up_from_win_rates(
+                    event.winRates,
+                )
 
-            # ── Batch flush to DB ──
-            if len(step_buffer) >= DB_BATCH_SIZE:
-                try:
-                    await _flush_to_db(simulation_id, step_buffer, i + 1)
-                    step_buffer.clear()
-                    db_flush_failures = 0
-                except Exception as e:
-                    db_flush_failures += 1
-                    logger.error(
-                        "DB flush failed for %s at step %d (%d/%d failures): %s",
-                        simulation_id, i + 1, db_flush_failures, MAX_DB_FLUSH_FAILURES, e,
+                if event.explored:
+                    thompson_explore_count += 1
+                confidence_labels.append(event.confidenceLabel)
+                safety_statuses.append(event.safetyStatus)
+
+                running_estimates = {
+                    t: round(float(event.runningMeanRewardPerArm.get(t, 0.0)), 4)
+                    for t in TREATMENTS
+                }
+                treatment_counts = {
+                    t: int(event.nUpdatesPerArm.get(t, 0)) for t in TREATMENTS
+                }
+
+                # ── Log progress ──
+                if (i + 1) % 10 == 0 or (i + 1) <= 5:
+                    logger.info(
+                        "Step %d/%d | %s -> %s (oracle: %s) | "
+                        "reward=%.2f | regret=%.2f | acc=%.2f%% | confidence=%s",
+                        i + 1, n_patients,
+                        selected_treatment,
+                        "Y" if event.selectedIdx == event.oracleOptimalIdx else "N",
+                        optimal_treatment,
+                        event.observedReward,
+                        event.regret,
+                        event.runningAccuracy * 100,
+                        event.confidenceLabel,
                     )
-                    if db_flush_failures >= MAX_DB_FLUSH_FAILURES:
-                        raise RuntimeError(
-                            f"Simulation aborted: {db_flush_failures} consecutive DB flush failures. "
-                            f"Last error: {e}"
-                        )
-                    # Keep buffer intact so next flush retries these steps
 
-        # ── Flush remaining steps ──
+                # ── Publish lean SSE payload via DTO ──
+                sse_step = SSEStepResponse.from_event(
+                    event,
+                    extras={
+                        "total_steps": n_patients,
+                        "selected_treatment": selected_treatment,
+                        "epsilon": round(epsilon, 6),
+                        "running_estimates": running_estimates,
+                        "treatment_counts": treatment_counts,
+                    },
+                )
+
+                await simulation_registry.publish(simulation_id, {
+                    "type": "step",
+                    "data": sse_step.model_dump_json(by_alias=True),
+                })
+
+                # ── Buffer for DB (full payload) ──
+                step_entity = _build_step_entity(
+                    simulation_id=simulation_id,
+                    event=event,
+                    patient=patient,
+                    epsilon=round(epsilon, 6),
+                    oracle_rewards=oracle_rewards,
+                    optimal_treatment=optimal_treatment,
+                    optimal_reward=optimal_reward,
+                    selected_treatment=selected_treatment,
+                    posterior_mean_best=posterior_mean_best,
+                    runner_up_name=runner_up_name,
+                    runner_up_wr=runner_up_wr,
+                    running_estimates=running_estimates,
+                    treatment_counts=treatment_counts,
+                )
+                step_buffer.append(step_entity)
+
+                # ── Batch flush to DB ──
+                if len(step_buffer) >= DB_BATCH_SIZE:
+                    try:
+                        await _flush_to_db(simulation_id, step_buffer, i + 1)
+                        step_buffer.clear()
+                        db_flush_failures = 0
+                    except Exception as e:
+                        db_flush_failures += 1
+                        logger.error(
+                            "DB flush failed for %s at step %d (%d/%d failures): %s",
+                            simulation_id, i + 1, db_flush_failures,
+                            MAX_DB_FLUSH_FAILURES, e,
+                        )
+                        if db_flush_failures >= MAX_DB_FLUSH_FAILURES:
+                            raise RuntimeError(
+                                f"Simulation aborted: {db_flush_failures} "
+                                f"consecutive DB flush failures. "
+                                f"Last error: {e}"
+                            )
+                        # Keep buffer intact so next flush retries these steps
+
+        # ── Flush remaining steps (with retries) ──
         if step_buffer:
-            try:
-                await _flush_to_db(simulation_id, step_buffer, n_patients)
-                step_buffer.clear()
-            except Exception as e:
-                raise RuntimeError(f"Final DB flush failed: {e}")
+            last_error = None
+            for attempt in range(1, MAX_DB_FLUSH_RETRIES + 1):
+                try:
+                    await _flush_to_db(simulation_id, step_buffer, n_patients)
+                    step_buffer.clear()
+                    last_error = None
+                    break
+                except Exception as e:
+                    last_error = e
+                    logger.error(
+                        "Final DB flush attempt %d/%d failed for %s: %s",
+                        attempt, MAX_DB_FLUSH_RETRIES, simulation_id, e,
+                    )
+                    if attempt < MAX_DB_FLUSH_RETRIES:
+                        await asyncio.sleep(2 ** attempt)  # exponential backoff
+            if last_error is not None:
+                lost_start = n_patients - len(step_buffer) + 1
+                logger.error(
+                    "Lost steps %d-%d for simulation %s after %d retries",
+                    lost_start, n_patients, simulation_id, MAX_DB_FLUSH_RETRIES,
+                )
+                raise RuntimeError(
+                    f"Final DB flush failed after {MAX_DB_FLUSH_RETRIES} "
+                    f"retries: {last_error}"
+                )
 
         # ── Final aggregates ──
+        if final_event is None:
+            raise RuntimeError("Simulation finished with zero steps")
+
         final = {
-            "final_accuracy": round(running_accuracy, 4),
-            "final_cumulative_reward": round(cumulative_reward, 4),
-            "final_cumulative_regret": round(cumulative_regret, 4),
-            "mean_reward": round(cumulative_reward / n_patients, 4),
-            "mean_regret": round(cumulative_regret / n_patients, 4),
+            "final_accuracy": round(float(final_event.runningAccuracy), 4),
+            "final_cumulative_reward": round(float(final_event.cumulativeReward), 4),
+            "final_cumulative_regret": round(float(final_event.cumulativeRegret), 4),
+            "mean_reward": round(float(final_event.cumulativeReward) / n_patients, 4),
+            "mean_regret": round(float(final_event.cumulativeRegret) / n_patients, 4),
             "thompson_exploration_rate": round(thompson_explore_count / n_patients, 4),
-            "treatment_counts": dict(treatment_counts),
+            "treatment_counts": {
+                t: int(final_event.nUpdatesPerArm.get(t, 0)) for t in TREATMENTS
+            },
             "confidence_distribution": dict(Counter(confidence_labels)),
             "safety_distribution": dict(Counter(safety_statuses)),
         }
@@ -643,7 +675,10 @@ async def run_simulation(
 
         logger.info(
             "Simulation %s completed: accuracy=%.4f, reward=%.4f, regret=%.4f",
-            simulation_id, running_accuracy, cumulative_reward, cumulative_regret,
+            simulation_id,
+            final_event.runningAccuracy,
+            final_event.cumulativeReward,
+            final_event.cumulativeRegret,
         )
 
     except asyncio.CancelledError:
