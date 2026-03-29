@@ -57,7 +57,7 @@ class Neo4jGraphDatabase:
         self,
         patient_profile: Dict[str, Any],
         limit: int = 5,
-        treatment_filter: Optional[str] = None,
+        treatment_filter: Optional[List[str]] = None,
         min_similarity: float = 0.5,
     ) -> List[Dict[str, Any]]:
         if not self.is_connected():
@@ -90,8 +90,11 @@ class Neo4jGraphDatabase:
 
         try:
             with self.driver.session() as session:
+                # treatment_filter is a list (or None). `IN` with a non-empty
+                # list restricts to those drug names; an empty/None filter
+                # adds no clause so all treatments come through.
                 treatment_clause = (
-                    "AND t.drug_name = $treatment_filter" if treatment_filter else ""
+                    "AND t.drug_name IN $treatment_filter" if treatment_filter else ""
                 )
 
                 query = f"""
@@ -153,6 +156,8 @@ class Neo4jGraphDatabase:
                        t.drug_class AS drug_class,
                        o.hba1c_reduction AS hba1c_reduction,
                        o.hba1c_followup AS hba1c_followup,
+                       o.bmi_reduction AS bmi_reduction,
+                       o.bmi_followup AS bmi_followup,
                        CASE
                          WHEN o.time_to_target IS NULL OR toString(o.time_to_target) = 'NaN'
                          THEN 'Unknown'
@@ -188,6 +193,10 @@ class Neo4jGraphDatabase:
 
                 similar_cases = []
                 for record in result:
+                    # All BMI / similarity fields are required by contract.
+                    # If Neo4j returns null for any of these, the loader is
+                    # broken — let the resulting TypeError propagate so the
+                    # bug surfaces instead of being papered over.
                     similar_cases.append({
                         "case_id": record["patient_id"],
                         "similarity_score": round(record["similarity_score"], 3),
@@ -211,6 +220,8 @@ class Neo4jGraphDatabase:
                         "outcome": {
                             "hba1c_reduction": round(record["hba1c_reduction"], 1),
                             "hba1c_followup": round(record["hba1c_followup"], 1),
+                            "bmi_reduction": round(record["bmi_reduction"], 2),
+                            "bmi_followup": round(record["bmi_followup"], 2),
                             "time_to_target": record["time_to_target"],
                             "adverse_events": record["adverse_events"],
                             "outcome_category": record["outcome_category"],
@@ -236,7 +247,7 @@ class Neo4jGraphDatabase:
         self,
         patient_profile: Dict[str, Any],
         limit: int = 5,
-        treatment_filter: Optional[str] = None,
+        treatment_filter: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         if not self.is_connected():
             return {"nodes": [], "edges": [], "metadata": {"error": "Neo4j not connected"}}
@@ -256,8 +267,9 @@ class Neo4jGraphDatabase:
 
         try:
             with self.driver.session() as session:
+                # See find_similar_patients() — multi-select treatment filter.
                 treatment_clause = (
-                    "AND t.drug_name = $treatment_filter" if treatment_filter else ""
+                    "AND t.drug_name IN $treatment_filter" if treatment_filter else ""
                 )
 
                 query = f"""
@@ -304,8 +316,11 @@ class Neo4jGraphDatabase:
                        patient_comorbidities,
                        t.drug_name AS treatment,
                        t.drug_class AS drug_class,
+                       t.short_label AS treatment_short_label,
                        o.hba1c_reduction AS reduction,
                        o.hba1c_followup AS hba1c_followup,
+                       o.bmi_reduction AS bmi_reduction,
+                       o.bmi_followup AS bmi_followup,
                        CASE
                          WHEN o.time_to_target IS NULL OR toString(o.time_to_target) = 'NaN'
                          THEN 'Unknown'
@@ -401,6 +416,8 @@ class Neo4jGraphDatabase:
                        t.evidence_level AS evidence_level,
                        o.hba1c_reduction AS hba1c_reduction,
                        o.hba1c_followup AS hba1c_followup,
+                       o.bmi_reduction AS bmi_reduction,
+                       o.bmi_followup AS bmi_followup,
                        CASE
                          WHEN o.time_to_target IS NULL OR toString(o.time_to_target) = 'NaN'
                          THEN 'Unknown'
@@ -463,9 +480,15 @@ class Neo4jGraphDatabase:
                     }
 
                 if record["hba1c_reduction"] is not None:
+                    # Loader writes all outcome fields together, so once
+                    # hba1c_reduction is present the rest must be too. Read
+                    # them directly so a missing field surfaces as TypeError
+                    # rather than silently shipping null downstream.
                     patient_data["outcome"] = {
                         "hba1c_reduction": round(float(record["hba1c_reduction"]), 1),
                         "hba1c_followup": round(float(record["hba1c_followup"]), 1),
+                        "bmi_reduction": round(float(record["bmi_reduction"]), 2),
+                        "bmi_followup": round(float(record["bmi_followup"]), 2),
                         "time_to_target": record["time_to_target"],
                         "adverse_events": record["adverse_events"],
                         "outcome_category": record["outcome_category"],
@@ -562,16 +585,25 @@ class Neo4jGraphDatabase:
             # Treatment node
             tid = f"treatment_{treatment_name}"
             if tid not in treatment_nodes_added:
+                # short_label is the chip text rendered inside the treatment
+                # node ("MET", "GLP", ...). The data generator + Neo4j
+                # loader always populate it, so a missing value is a loader
+                # bug — read it directly so the KeyError surfaces.
                 nodes.append({
                     "id": tid,
                     "type": "treatment",
                     "label": treatment_name,
-                    "data": {"treatment": treatment_name, "drug_class": rec["drug_class"]},
+                    "data": {
+                        "treatment": treatment_name,
+                        "drug_class": rec["drug_class"],
+                        "short_label": rec["treatment_short_label"],
+                    },
                     "style": {"color": "#4ECDC4", "size": "medium", "shape": "square"},
                 })
                 treatment_nodes_added.add(tid)
 
-            # Outcome node
+            # Outcome node — BMI fields are required (loader writes both
+            # bmi_reduction and bmi_followup for every patient outcome).
             oid = f"outcome_{pid}"
             nodes.append({
                 "id": oid,
@@ -580,6 +612,8 @@ class Neo4jGraphDatabase:
                 "data": {
                     "hba1c_reduction": round(rec["reduction"], 1),
                     "hba1c_followup": round(rec["hba1c_followup"], 1),
+                    "bmi_reduction": round(rec["bmi_reduction"], 2),
+                    "bmi_followup": round(rec["bmi_followup"], 2),
                     "time_to_target": rec["time_to_target"],
                     "adverse_events": rec["adverse_events"],
                     "outcome_category": rec["outcome_category"],

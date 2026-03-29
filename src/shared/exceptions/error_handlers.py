@@ -12,6 +12,13 @@ from pydantic import ValidationError
 
 from src.shared.responses.api_response import ApiResponse, ErrorDetail
 from src.shared.exceptions.exceptions import AppException
+from src.shared.inference import (
+    ConfigurationError as InferenceConfigurationError,
+    ExplanationError as InferenceExplanationError,
+    InferenceError,
+    ModelError as InferenceModelError,
+    ValidationError as InferenceValidationError,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -49,6 +56,102 @@ def register_error_handlers(app: FastAPI) -> None:
             message="Please check your input and try again",
         )
         return JSONResponse(status_code=400, content=response.model_dump(exclude_none=True, by_alias=True))
+
+    @app.exception_handler(InferenceValidationError)
+    async def handle_inference_validation_error(_req: Request, exc: InferenceValidationError):
+        builder = ErrorDetail.builder("Validation Failed", "INFERENCE_VALIDATION_ERROR", 422)
+        for error in exc.errors():
+            loc = error.get("loc") or []
+            field = ".".join(str(p) for p in loc) or "_"
+            builder.add_field_error(field, str(error.get("msg", "Invalid value")))
+        if not exc.errors():
+            builder.add_detail(str(exc) or "Invalid inference input")
+        response = ApiResponse.failure(
+            error=builder.build(),
+            message="Please check your input and try again",
+        )
+        return JSONResponse(status_code=422, content=response.model_dump(exclude_none=True, by_alias=True))
+
+    @app.exception_handler(InferenceConfigurationError)
+    async def handle_inference_configuration_error(_req: Request, exc: InferenceConfigurationError):
+        logger.error("Inference configuration error: %s", exc, exc_info=True)
+        error = ErrorDetail(
+            title="Service Unavailable",
+            code="INFERENCE_CONFIGURATION_ERROR",
+            status=503,
+            details=[str(exc) or "Inference engine is misconfigured."],
+        )
+        response = ApiResponse.failure(
+            error=error,
+            message="The service is temporarily unavailable",
+        )
+        return JSONResponse(status_code=503, content=response.model_dump(exclude_none=True, by_alias=True))
+
+    @app.exception_handler(InferenceModelError)
+    async def handle_inference_model_error(_req: Request, exc: InferenceModelError):
+        logger.error("Inference model error: %s", exc, exc_info=True)
+        error = ErrorDetail(
+            title="Inference Failed",
+            code="INFERENCE_MODEL_ERROR",
+            status=500,
+            details=[str(exc) or "The model failed during inference."],
+        )
+        response = ApiResponse.failure(
+            error=error,
+            message="Something went wrong. Please try again later",
+        )
+        return JSONResponse(status_code=500, content=response.model_dump(exclude_none=True, by_alias=True))
+
+    @app.exception_handler(InferenceExplanationError)
+    async def handle_inference_explanation_error(_req: Request, exc: InferenceExplanationError):
+        exc_str = str(exc)
+        is_key_error = (
+            "API key" in exc_str
+            or "API_KEY_INVALID" in exc_str
+            or "LLM generate call failed" in exc_str
+        )
+        if is_key_error:
+            logger.error("LLM dependency error: %s", exc)
+            error = ErrorDetail(
+                title="AI Explanation Unavailable",
+                code="LLM_UNAVAILABLE",
+                status=503,
+                details=["The AI explanation service is temporarily unavailable. "
+                         "Please contact your administrator."],
+            )
+            response = ApiResponse.failure(
+                error=error,
+                message="AI explanation service is unavailable",
+            )
+            return JSONResponse(status_code=503, content=response.model_dump(exclude_none=True, by_alias=True))
+
+        logger.error("Inference explanation error: %s", exc, exc_info=True)
+        error = ErrorDetail(
+            title="Explanation Failed",
+            code="INFERENCE_EXPLANATION_ERROR",
+            status=500,
+            details=[exc_str or "The explanation step failed."],
+        )
+        response = ApiResponse.failure(
+            error=error,
+            message="Prediction explanation could not be generated",
+        )
+        return JSONResponse(status_code=500, content=response.model_dump(exclude_none=True, by_alias=True))
+
+    @app.exception_handler(InferenceError)
+    async def handle_inference_error(_req: Request, exc: InferenceError):
+        logger.error("Unclassified inference error: %s", exc, exc_info=True)
+        error = ErrorDetail(
+            title="Inference Error",
+            code="INFERENCE_ERROR",
+            status=500,
+            details=[str(exc) or "An inference error occurred."],
+        )
+        response = ApiResponse.failure(
+            error=error,
+            message="Something went wrong. Please try again later",
+        )
+        return JSONResponse(status_code=500, content=response.model_dump(exclude_none=True, by_alias=True))
 
     @app.exception_handler(StarletteHTTPException)
     async def handle_http_exception(req: Request, exc: StarletteHTTPException):
