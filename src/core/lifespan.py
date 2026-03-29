@@ -6,7 +6,7 @@ from fastapi import FastAPI
 from src.shared.database.engine import engine
 from src.shared.neo4j import connect, close as close_neo4j
 from src.configs import neo4j as neo4j_config
-from src.configs import logging as log_config, model as model_config
+from src.configs import logging as log_config
 
 
 logger = logging.getLogger(__name__)
@@ -30,14 +30,54 @@ def _setup_logging() -> None:
     )
 
 
-def _load_models() -> None:
-    from src.modules.models.internal.model_loader import registry
+def _build_engine(app: FastAPI) -> None:
+    from src.shared.inference_bootstrap import build_inference_engine
 
-    registry.load(
-        name="default",
-        model_file=model_config.model_file,
-        pipeline_file=model_config.pipeline_file,
-    )
+    app.state.engine = build_inference_engine()
+
+
+async def _recover_orphaned_simulations() -> None:
+    """
+    Mark any simulations left in RUNNING status as FAILED on startup.
+    This handles the case where the server process restarted (crash, deploy,
+    OOM kill) while simulations were running — their background tasks died
+    but the DB records were never updated.
+    """
+    from sqlalchemy import update
+    from src.modules.simulations.domain.models.simulation import Simulation
+    from src.modules.simulations.domain.models.enums import SimulationStatus
+    from src.shared.database import async_session
+
+    async with async_session() as session:
+        async with session.begin():
+            stmt = (
+                update(Simulation)
+                .where(Simulation.status == SimulationStatus.RUNNING)
+                .values(
+                    status=SimulationStatus.FAILED,
+                    error_message="Server restarted during simulation",
+                )
+            )
+            result = await session.execute(stmt)
+            count = result.rowcount
+            if count:
+                logger.warning("Recovered %d orphaned RUNNING simulation(s) → FAILED", count)
+
+
+async def _periodic_registry_sweep() -> None:
+    """Sweep stale registry entries every 10 minutes."""
+    from src.modules.simulations.internal.simulation_runner import simulation_registry
+
+    while True:
+        try:
+            await asyncio.sleep(600)  # 10 minutes
+            swept = simulation_registry.sweep_stale()
+            if swept:
+                logger.info("Periodic sweep removed %d stale registry entries", swept)
+        except asyncio.CancelledError:
+            break
+        except Exception:
+            logger.exception("Error in periodic registry sweep")
 
 
 @asynccontextmanager
@@ -46,11 +86,12 @@ async def lifespan(app: FastAPI):
     _setup_logging()
     logger.info("Starting up — logging and DB pool initialised")
 
+    app.state.engine = None
     try:
-        _load_models()
-        logger.info("ML models loaded into memory")
+        _build_engine(app)
+        logger.info("InferenceEngine constructed (ready=%s)", app.state.engine.ready)
     except Exception as e:
-        logger.error("Failed to load ML models: %s", e)
+        logger.error("InferenceEngine construction failed: %s", e)
 
     # Neo4j
     try:
@@ -65,15 +106,27 @@ async def lifespan(app: FastAPI):
     except Exception as e:
         logger.error("Admin seeding failed: %s", e)
 
+    # Recover orphaned simulations from previous process lifecycle
+    try:
+        await _recover_orphaned_simulations()
+    except Exception as e:
+        logger.error("Orphaned simulation recovery failed: %s", e)
+
     from src.modules.auth.internal.token_cleanup import start_token_cleanup
     cleanup_task = asyncio.create_task(start_token_cleanup())
+    sweep_task = asyncio.create_task(_periodic_registry_sweep())
 
     yield
 
     # ── Shutdown ──
     cleanup_task.cancel()
+    sweep_task.cancel()
     try:
         await cleanup_task
+    except asyncio.CancelledError:
+        pass
+    try:
+        await sweep_task
     except asyncio.CancelledError:
         pass
 

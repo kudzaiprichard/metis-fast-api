@@ -1,4 +1,4 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from src.configs import application
 from src.core.lifespan import lifespan
 from src.core.middleware import register_middleware
@@ -15,9 +15,24 @@ def create_app() -> FastAPI:
 
     register_middleware(app)
     register_error_handlers(app)
+    _register_health(app)
     _register_routers(app)
 
     return app
+
+
+def _register_health(app: FastAPI) -> None:
+    @app.get("/health", tags=["Health"])
+    async def health(request: Request):
+        engine = getattr(request.app.state, "engine", None)
+        snapshot = engine.snapshot() if engine is not None else None
+        return {
+            "status": "ok",
+            "engine": {
+                "ready": bool(engine is not None and engine.ready),
+                "snapshot": snapshot,
+            },
+        }
 
 
 def _register_routers(app: FastAPI) -> None:
