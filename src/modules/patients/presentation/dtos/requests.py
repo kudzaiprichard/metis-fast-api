@@ -1,5 +1,5 @@
 from datetime import date
-from typing import Optional
+from typing import List, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field, model_validator
@@ -56,7 +56,9 @@ class FindSimilarPatientsRequest(BaseModel):
     patient_id: Optional[UUID] = Field(None, description="Uses latest medical record")
     medical_record_id: Optional[UUID] = Field(None, description="Uses specific medical record")
     limit: int = Field(default=20, ge=1, le=100, description="Max total matches from Neo4j")
-    treatment_filter: Optional[str] = None
+    # List of drug names to restrict results to. Empty list / None means "all
+    # treatments". Multi-select on the frontend feeds this directly.
+    treatment_filter: Optional[List[str]] = Field(default=None, description="Drug names to include")
     min_similarity: float = Field(default=0.5, ge=0.0, le=1.0)
 
     @model_validator(mode="after")
@@ -71,7 +73,8 @@ class FindSimilarPatientsGraphRequest(BaseModel):
     patient_id: Optional[UUID] = Field(None, description="Uses latest medical record")
     medical_record_id: Optional[UUID] = Field(None, description="Uses specific medical record")
     limit: int = Field(default=5, ge=1, le=20)
-    treatment_filter: Optional[str] = None
+    # See FindSimilarPatientsRequest.treatment_filter.
+    treatment_filter: Optional[List[str]] = Field(default=None, description="Drug names to include")
 
     @model_validator(mode="after")
     def require_at_least_one_id(self):

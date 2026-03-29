@@ -170,6 +170,12 @@ class SimilarPatientProfileResponse(BaseModel):
 class SimilarPatientOutcomeResponse(BaseModel):
     hba1c_reduction: float = Field(alias="hba1cReduction")
     hba1c_followup: float = Field(alias="hba1cFollowup")
+    # Required. The data generator + Neo4j loader always populate BMI
+    # follow-up + reduction, so a missing value here means the loader is
+    # broken — we want the missing-key KeyError to surface instead of
+    # silently shipping null to the frontend.
+    bmi_reduction: float = Field(alias="bmiReduction")
+    bmi_followup: float = Field(alias="bmiFollowup")
     time_to_target: str = Field(alias="timeToTarget")
     adverse_events: str = Field(alias="adverseEvents")
     outcome_category: str = Field(alias="outcomeCategory")
@@ -183,6 +189,8 @@ class SimilarPatientOutcomeResponse(BaseModel):
         return SimilarPatientOutcomeResponse(
             hba1cReduction=data["hba1c_reduction"],
             hba1cFollowup=data["hba1c_followup"],
+            bmiReduction=data["bmi_reduction"],
+            bmiFollowup=data["bmi_followup"],
             timeToTarget=data["time_to_target"],
             adverseEvents=data["adverse_events"],
             outcomeCategory=data["outcome_category"],

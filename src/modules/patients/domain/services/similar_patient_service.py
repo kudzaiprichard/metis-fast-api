@@ -47,7 +47,7 @@ class SimilarPatientService:
         patient_id: Optional[UUID] = None,
         medical_record_id: Optional[UUID] = None,
         limit: int = 20,
-        treatment_filter: Optional[str] = None,
+        treatment_filter: Optional[List[str]] = None,
         min_similarity: float = 0.5,
     ) -> Tuple[List[Dict[str, Any]], str]:
         """
@@ -90,7 +90,7 @@ class SimilarPatientService:
         patient_id: Optional[UUID] = None,
         medical_record_id: Optional[UUID] = None,
         limit: int = 5,
-        treatment_filter: Optional[str] = None,
+        treatment_filter: Optional[List[str]] = None,
     ) -> Dict[str, Any]:
         """
         Find similar patients in graph format for visualization.
@@ -102,7 +102,24 @@ class SimilarPatientService:
             patient_id, medical_record_id
         )
         self._check_neo4j()
-        profile = self._build_profile(record)
+        # Fetch the patient so the graph metadata can ship gender alongside
+        # the numeric vitals. Gender lives on Patient (not MedicalRecord);
+        # the graph view's context strip uses it to render the "49F" pill.
+        # If the patient row went missing (e.g. record points at a deleted
+        # patient), fail loudly rather than silently shipping a profile
+        # without gender.
+        patient = await self.patient_repo.get_by_id(resolved_patient_id)
+        if not patient:
+            raise NotFoundException(
+                message="The patient linked to this record no longer exists",
+                error_detail=ErrorDetail(
+                    title="Patient Not Found",
+                    code="PATIENT_NOT_FOUND",
+                    status=404,
+                    details=[f"Patient with ID {resolved_patient_id} does not exist"],
+                ),
+            )
+        profile = self._build_profile(record, patient_gender=patient.gender)
 
         try:
             graph_data = await asyncio.to_thread(
@@ -227,8 +244,11 @@ class SimilarPatientService:
             )
 
     @staticmethod
-    def _build_profile(record: MedicalRecord) -> Dict[str, Any]:
-        return {
+    def _build_profile(
+        record: MedicalRecord,
+        patient_gender: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        profile: Dict[str, Any] = {
             "age": record.age,
             "hba1c_baseline": float(record.hba1c_baseline),
             "diabetes_duration": float(record.diabetes_duration),
@@ -246,3 +266,10 @@ class SimilarPatientService:
             "nafld": record.nafld,
             "hypertension": record.hypertension,
         }
+        # `gender` is only attached by the graph endpoint (the tabular flow
+        # exposes per-result gender on each row already). When the graph
+        # endpoint passes `patient_gender`, attach it; absence means the
+        # caller deliberately didn't request gender enrichment.
+        if patient_gender is not None:
+            profile["gender"] = patient_gender
+        return profile
