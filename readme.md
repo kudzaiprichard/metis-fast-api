@@ -32,6 +32,7 @@ and the API service deployable, with `bandits/inference/` vendored verbatim unde
 1. [What this service does](#what-this-service-does)
 2. [Tech stack](#tech-stack)
 3. [Quick start](#quick-start)
+   - [Set up the clinical knowledge graph](#set-up-the-clinical-knowledge-graph)
 4. [Configuration](#configuration)
 5. [Project structure](#project-structure)
 6. [Architecture](#architecture)
@@ -126,8 +127,8 @@ the imports below or freeze the local venv.
 
 - Python 3.11+
 - PostgreSQL with a database you can connect to
-- Neo4j 5.x (the similar-patient endpoints require a populated graph; everything else still
-  works if Neo4j fails to connect — see `lifespan.py`)
+- Neo4j 5.x — the graph itself ships with this repo; import it with
+  `python -m scripts.import_graph` (see [docs/GRAPH_DATABASE.md](docs/GRAPH_DATABASE.md))
 - A trained NeuralThompson checkpoint and a fitted FeaturePipeline `.joblib`
 - Optional: a Gemini API key if you want LLM explanations
 
@@ -177,6 +178,110 @@ psql -c "CREATE DATABASE metis;"
 # apply migrations
 alembic upgrade head
 ```
+
+### Set up the clinical knowledge graph
+
+The similar-patient endpoints read from a Neo4j graph of 20,000 historical
+diabetes cases. **That graph ships with this repository** — you do not need to
+build or source it separately. It lives at `data/metis_graph.jsonl.gz` (3.2 MB)
+and is loaded with one command.
+
+**1. Start a Neo4j instance.** Neo4j 5.x or 2025.x, Community or Enterprise —
+Desktop, Docker, or a local server all work. For example:
+
+```bash
+docker run -d --name metis-neo4j \
+  -p 7474:7474 -p 7687:7687 \
+  -e NEO4J_AUTH=neo4j/your-password \
+  neo4j:5
+```
+
+**2. Point the API at it** in `.env`:
+
+```dotenv
+NEO4J_URI=neo4j://localhost:7687
+NEO4J_USERNAME=neo4j
+NEO4J_PASSWORD=your-password
+```
+
+`NEO4J_PASSWORD` is marked `required` in `application.yaml` — the app exits at
+startup if it is unset.
+
+**3. Import the graph:**
+
+```bash
+python -m scripts.import_graph
+```
+
+Takes about 17 seconds and prints what it loaded:
+
+```
+Import complete in 16.5s
+  nodes:         40048 imported, 40048 in database
+  relationships: 86250 imported, 86250 in database
+```
+
+That is 40,048 nodes, 86,250 relationships, 7 uniqueness constraints and 10
+range indexes:
+
+| Node | Count | Key property |
+| --- | --- | --- |
+| `Patient` | 20,000 | `patient_id` |
+| `Outcome` | 20,000 | `outcome_id` |
+| `Guideline` | 15 | `guideline_id` |
+| `Contraindication` | 12 | `contraindication_id` |
+| `DrugInteraction` | 11 | `interaction_id` |
+| `Treatment` | 5 | `drug_name` |
+| `Comorbidity` | 5 | `condition_name` |
+
+| Relationship | Count | Shape |
+| --- | --- | --- |
+| `HAS_CONDITION` | 46,212 | `Patient → Comorbidity` |
+| `RECEIVED_TREATMENT` | 20,000 | `Patient → Treatment` |
+| `RESULTED_IN` | 20,000 | `Treatment → Outcome` |
+| `HAS_GUIDELINE` | 15 | `Treatment → Guideline` |
+| `CONTRAINDICATED_BY` | 12 | `Treatment → Contraindication` |
+| `INTERACTS_WITH` | 11 | `Treatment → DrugInteraction` |
+
+**4. Confirm it worked.** After starting the API, `GET /health` reports the live
+node and relationship counts. Or query Neo4j directly:
+
+```cypher
+MATCH (n) RETURN count(n);          // 40048
+MATCH ()-[r]->() RETURN count(r);   // 86250
+```
+
+#### Useful flags
+
+| Flag | Effect |
+| --- | --- |
+| `--drop-existing` | Wipe the target database first. Without it the importer refuses to touch a database that already has nodes. |
+| `--database NAME` | Import into a non-default database (Enterprise only). |
+| `--input PATH` | Read a bundle from somewhere other than `data/`. |
+| `--with-similarity` | Additionally rebuild ~10.6M derived `SIMILAR_TO` edges. Needs `numpy`, takes ~8 minutes, and is **not** required — see below. |
+
+#### About `SIMILAR_TO`
+
+The graph this was exported from also held 10,616,965 `SIMILAR_TO` relationships
+between patients — 99.2% of all its relationships. They are deliberately not in
+the bundle, because nothing queries them (the similar-patient endpoints compute
+similarity in Cypher at request time) and they are fully derivable from the
+Patient nodes that *are* included. Leaving them out is what keeps the file at
+3.2 MB rather than a few hundred megabytes.
+
+**Every endpoint behaves identically without them.** `--with-similarity`
+regenerates them exactly if you want to work with the edges directly.
+
+#### Re-exporting after you change the graph
+
+```bash
+python -m scripts.export_graph
+```
+
+Rewrites `data/metis_graph.jsonl.gz` from whatever `NEO4J_URI` points at.
+
+Full reference — graph schema, bundle format, the exact `SIMILAR_TO` rule, and
+troubleshooting — is in [docs/GRAPH_DATABASE.md](docs/GRAPH_DATABASE.md).
 
 ### Run
 
@@ -253,8 +358,15 @@ fast_api/
 ├── alembic/                     # Async migrations (4 revisions, see § Migrations)
 │   ├── env.py
 │   └── versions/
+├── data/
+│   └── metis_graph.jsonl.gz     # Exported Neo4j clinical knowledge graph
 ├── docs/
-│   └── API_INTEGRATION.md       # Frontend-facing endpoint reference
+│   ├── API_INTEGRATION.md       # Frontend-facing endpoint reference
+│   └── GRAPH_DATABASE.md        # Graph import/export + schema reference
+├── scripts/
+│   ├── _graph_bundle.py         # Bundle format, NaN encoding, similarity rule
+│   ├── export_graph.py          # Neo4j → data/metis_graph.jsonl.gz
+│   └── import_graph.py          # data/metis_graph.jsonl.gz → Neo4j
 ├── src/
 │   ├── configs/                 # YAML + env-var loader, .pyi stub generator
 │   ├── core/
@@ -644,7 +756,8 @@ CRUD on `Patient` and `MedicalRecord`:
 The Cypher query computes a weighted score: `0.7 · clinical_similarity + 0.3 ·
 comorbidity_jaccard`, filtered by age group + Hba1c severity + bounded distance on
 `hba1c_baseline`/`c_peptide`. If Neo4j is not connected, every endpoint returns a 503 with
-`code=NEO4J_UNAVAILABLE`.
+`code=NEO4J_UNAVAILABLE`. These endpoints also return empty results against an empty graph —
+see [Set up the clinical knowledge graph](#set-up-the-clinical-knowledge-graph) for loading it.
 
 ### Inference (stateless)
 
