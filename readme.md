@@ -289,7 +289,7 @@ troubleshooting — is in [docs/GRAPH_DATABASE.md](docs/GRAPH_DATABASE.md).
 python main.py
 ```
 
-The app boots at `http://127.0.0.1:8000`. Swagger UI: `/docs`. Health: `/health`.
+The app boots at `http://127.0.0.1:8001`. Swagger UI: `/docs`. Health: `/health`.
 
 ---
 

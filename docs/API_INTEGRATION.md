@@ -14,7 +14,7 @@ All endpoints are served under:
 http://<host>:<port>
 ```
 
-The default local server runs on `http://127.0.0.1:8000`. Health check aside, every business endpoint lives beneath `/api/v1/...`.
+The default local server runs on `http://127.0.0.1:8001`. Health check aside, every business endpoint lives beneath `/api/v1/...`.
 
 ### 1.2 Content types
 
