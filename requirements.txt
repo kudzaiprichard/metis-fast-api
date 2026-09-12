@@ -14,6 +14,10 @@ fastapi==0.135.1
 uvicorn==0.41.0
 starlette==0.52.1
 sse-starlette==3.3.2
+# Required by FastAPI to parse the multipart upload on POST /simulations
+python-multipart==0.0.22
+# Backs uvicorn's reload=True in main.py; without it reload falls back to polling
+watchfiles==1.1.1
 
 # --- Persistence -------------------------------------------------------------
 SQLAlchemy==2.0.48
