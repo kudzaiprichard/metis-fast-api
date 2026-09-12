@@ -129,7 +129,10 @@ the imports below or freeze the local venv.
 - PostgreSQL with a database you can connect to
 - Neo4j 5.x — the graph itself ships with this repo; import it with
   `python -m scripts.import_graph` (see [docs/GRAPH_DATABASE.md](docs/GRAPH_DATABASE.md))
-- A trained NeuralThompson checkpoint and a fitted FeaturePipeline `.joblib`
+- A trained NeuralThompson checkpoint and a fitted FeaturePipeline `.joblib`. Download
+  both from the [`models-v1.0.0` release](https://github.com/kudzaiprichard/diabetes-bandits/releases/tag/models-v1.0.0)
+  of `diabetes-bandits`, or train them there with `python -m src.cli train`. They are a
+  matched pair — point `MODEL_PATH` at the folder holding them.
 - Optional: a Gemini API key if you want LLM explanations. Leave `GEMINI_API_KEY`
   unset and the service still boots — `inference_bootstrap` reports
   `llm_enabled=False` and predictions are returned without an explanation.
