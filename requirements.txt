@@ -1,0 +1,46 @@
+# metis-fast-api — runtime dependencies, pinned to the versions this service
+# is developed and tested against.
+#
+#   python -m venv venv
+#   venv\Scripts\activate          # Windows
+#   source venv/bin/activate       # macOS / Linux
+#   pip install -r requirements.txt
+#
+# torch is the CPU build by default. For CUDA, install it first from
+# https://pytorch.org/get-started/locally/ and then run this file.
+
+# --- Web framework -----------------------------------------------------------
+fastapi==0.135.1
+uvicorn==0.41.0
+starlette==0.52.1
+sse-starlette==3.3.2
+
+# --- Persistence -------------------------------------------------------------
+SQLAlchemy==2.0.48
+asyncpg==0.31.0
+greenlet==3.3.2
+alembic==1.18.4
+neo4j==6.1.0
+
+# --- Config and validation ---------------------------------------------------
+pydantic==2.12.5
+pydantic-settings==2.13.1
+email-validator==2.3.0
+python-dotenv==1.2.2
+PyYAML==6.0.3
+
+# --- Auth --------------------------------------------------------------------
+PyJWT==2.11.0
+bcrypt==5.0.0
+
+# --- Inference (vendored src/shared/inference) -------------------------------
+torch==2.8.0
+numpy==1.26.4
+pandas==3.0.1
+scikit-learn==1.8.0
+scipy==1.17.1
+joblib==1.5.2
+
+# --- Logging and LLM ---------------------------------------------------------
+loguru==0.7.3
+google-genai==1.66.0

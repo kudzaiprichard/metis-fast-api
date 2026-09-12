@@ -130,7 +130,9 @@ the imports below or freeze the local venv.
 - Neo4j 5.x — the graph itself ships with this repo; import it with
   `python -m scripts.import_graph` (see [docs/GRAPH_DATABASE.md](docs/GRAPH_DATABASE.md))
 - A trained NeuralThompson checkpoint and a fitted FeaturePipeline `.joblib`
-- Optional: a Gemini API key if you want LLM explanations
+- Optional: a Gemini API key if you want LLM explanations. Leave `GEMINI_API_KEY`
+  unset and the service still boots — `inference_bootstrap` reports
+  `llm_enabled=False` and predictions are returned without an explanation.
 
 ### Install
 
@@ -143,10 +145,7 @@ venv\Scripts\activate
 # *nix
 source venv/bin/activate
 
-pip install fastapi uvicorn "sqlalchemy[asyncio]" asyncpg alembic \
-            "pydantic[email]" python-dotenv pyyaml pyjwt bcrypt \
-            torch numpy pandas joblib scikit-learn loguru \
-            google-genai sse-starlette neo4j
+pip install -r requirements.txt
 ```
 
 ### Configure

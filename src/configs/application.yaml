@@ -51,7 +51,9 @@ model:
   pipeline_file: "${PIPELINE_FILE:feature_pipeline_scaled.joblib} | str"
 
 gemini:
-  api_key: "${GEMINI_API_KEY} | str | required"
+  # Optional. Unset leaves llm_enabled False in inference_bootstrap, so the API
+  # boots and serves predictions without explanations. explain="require" errors.
+  api_key: "${GEMINI_API_KEY:} | str"
   model_name: "${GEMINI_MODEL:gemini-2.5-flash} | str"
   temperature: "${GEMINI_TEMPERATURE:0.3} | float"
 
